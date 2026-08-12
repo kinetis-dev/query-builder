@@ -38,7 +38,7 @@ you pass in — and composes directly inside
 composer require kinetis/query-builder
 ```
 
-Requires PHP 8.4+ and `kinetis/kinetis`. Full documentation:
+Requires PHP 8.4+ and `kinetis/framework`. Full documentation:
 [docs.kinetis.dev/query-builder.html](https://docs.kinetis.dev/query-builder.html).
 
 ## License
