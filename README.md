@@ -1,0 +1,46 @@
+<p align="center">
+  <img src="logo.svg" alt="Kinetis" width="420">
+</p>
+
+<p align="center">
+  <strong>kinetis/query-builder</strong>
+  <br>
+  <strong>A thin, parameterized SQL query builder for Kinetis</strong>
+</p>
+
+---
+
+MySQL and Postgres via `amphp/mysql`/`amphp/postgres`, with row-to-DTO
+mapping via `Kinetis\Validation\Hydrator` — the same mechanism that
+hydrates a `#[Body]` request DTO. Not an ORM: no relationships, no
+migrations, no change-tracking, no `save()`-on-a-model.
+
+```php
+use Kinetis\QueryBuilder\Query;
+
+$orders = new Query($db)
+    ->table('orders')
+    ->where('customer_id', '=', $customerId)
+    ->where('status', '!=', 'cancelled')
+    ->orderBy('created_at', 'desc')
+    ->limit(20)
+    ->get(OrderRow::class);
+```
+
+`Query` works with either backend through the same shared `Amp\Sql\SqlLink`
+family both drivers implement, auto-detected from the concrete connection
+you pass in — and composes directly inside
+`Kinetis\Persistence\TransactionGuard::transaction()`.
+
+## Installation
+
+```sh
+composer require kinetis/query-builder
+```
+
+Requires PHP 8.4+ and `kinetis/kinetis`. Full documentation:
+[docs.kinetis.dev/query-builder.html](https://docs.kinetis.dev/query-builder.html).
+
+## License
+
+MIT — see [LICENSE](../../LICENSE).
