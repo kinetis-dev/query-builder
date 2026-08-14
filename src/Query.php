@@ -10,7 +10,9 @@ use Kinetis\QueryBuilder\Dialect\MySqlDialect;
 use Kinetis\QueryBuilder\Dialect\PostgresDialect;
 use Kinetis\Validation\Hydrator;
 use Amp\Mysql\MysqlLink;
+use Amp\Mysql\MysqlResult;
 use Amp\Postgres\PostgresLink;
+use Amp\Postgres\PostgresResult;
 use InvalidArgumentException;
 
 /**
@@ -115,6 +117,19 @@ final class Query
     private static function detectDialect(MysqlLink|PostgresLink $link): Dialect
     {
         return $link instanceof MysqlLink ? new MySqlDialect() : new PostgresDialect();
+    }
+
+    /**
+     * $link->execute() always goes through MySQL/Postgres's own prepared-
+     * statement protocol (a real PREPARE round-trip before EXECUTE), even
+     * for a query with nothing to bind — $link->query() skips that
+     * entirely for the common case of no bound parameters at all.
+     *
+     * @param list<mixed> $params
+     */
+    private function run(string $sql, array $params): MysqlResult|PostgresResult
+    {
+        return $params === [] ? $this->link->query($sql) : $this->link->execute($sql, $params);
     }
 
     public function table(string $table): static
@@ -245,7 +260,7 @@ final class Query
     public function get(?string $dtoClass = null): array
     {
         $compiled = $this->toSelectSql();
-        $result = $this->link->execute($compiled->sql, $compiled->params);
+        $result = $this->run($compiled->sql, $compiled->params);
 
         $rows = [];
 
@@ -269,7 +284,7 @@ final class Query
     public function count(): int
     {
         $compiled = $this->toSelectSql(countOnly: true);
-        $result = $this->link->execute($compiled->sql, $compiled->params);
+        $result = $this->run($compiled->sql, $compiled->params);
 
         /** @var array<string, mixed>|null $row */
         $row = $result->fetchRow();
@@ -326,7 +341,7 @@ final class Query
         }
 
         $compiled = $this->orderBy($cursorColumn)->limit($perPage + 1)->toSelectSql();
-        $result = $this->link->execute($compiled->sql, $compiled->params);
+        $result = $this->run($compiled->sql, $compiled->params);
 
         /** @var list<array<string, mixed>> $rows */
         $rows = [];
@@ -369,7 +384,7 @@ final class Query
             implode(', ', array_fill(0, count($columns), '?')),
         );
 
-        $this->link->execute($sql, array_values($data));
+        $this->run($sql, array_values($data));
     }
 
     /**
@@ -378,7 +393,7 @@ final class Query
     public function insertGetId(array $data, string $primaryKey = 'id'): int|string|null
     {
         $compiled = $this->dialect->insertGetIdQuery($this->table, $data, $primaryKey);
-        $result = $this->link->execute($compiled->sql, $compiled->params);
+        $result = $this->run($compiled->sql, $compiled->params);
 
         return $this->dialect->extractInsertedId($result, $primaryKey);
     }
@@ -389,7 +404,7 @@ final class Query
     public function update(array $data): int
     {
         $compiled = $this->toUpdateSql($data);
-        $result = $this->link->execute($compiled->sql, $compiled->params);
+        $result = $this->run($compiled->sql, $compiled->params);
 
         return $result->getRowCount() ?? 0;
     }
@@ -397,7 +412,7 @@ final class Query
     public function delete(): int
     {
         $compiled = $this->toDeleteSql();
-        $result = $this->link->execute($compiled->sql, $compiled->params);
+        $result = $this->run($compiled->sql, $compiled->params);
 
         return $result->getRowCount() ?? 0;
     }
