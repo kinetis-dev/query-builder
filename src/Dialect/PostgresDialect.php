@@ -6,7 +6,9 @@ namespace Kinetis\QueryBuilder\Dialect;
 
 use Kinetis\QueryBuilder\CompiledQuery;
 use Kinetis\QueryBuilder\Dialect;
+use Amp\Mysql\MysqlLink;
 use Amp\Mysql\MysqlResult;
+use Amp\Postgres\PostgresLink;
 use Amp\Postgres\PostgresResult;
 
 final class PostgresDialect implements Dialect
@@ -48,5 +50,33 @@ final class PostgresDialect implements Dialect
         $value = $result->fetchRow()[$primaryKey] ?? null;
 
         return is_int($value) || is_string($value) ? $value : null;
+    }
+
+    /**
+     * Unlike MySqlDialect, no charset allow-list or SQL-mode caveat is
+     * needed here — quoteLiteral() is amphp/postgres's own real, native
+     * escaping call (see PostgresExecutor::quoteLiteral()), not a
+     * reimplementation this class has to get right itself.
+     */
+    #[\Override]
+    public function literalFor(mixed $value, MysqlLink|PostgresLink $link): ?string
+    {
+        if (is_int($value)) {
+            return (string) $value;
+        }
+
+        if (is_bool($value)) {
+            return $value ? 'TRUE' : 'FALSE';
+        }
+
+        if (!is_string($value)) {
+            return null;
+        }
+
+        if (!$link instanceof PostgresLink) {
+            return null;
+        }
+
+        return $link->quoteLiteral($value);
     }
 }

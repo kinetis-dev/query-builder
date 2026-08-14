@@ -101,6 +101,13 @@ final class Query
 
     private ?int $offsetValue = null;
 
+    /**
+     * Set by whereRaw()/selectRaw()/orderByRaw() — see run()'s own
+     * docblock for why this disables literal-inlining for the whole query
+     * once any raw SQL text is involved.
+     */
+    private bool $hasRawFragment = false;
+
     public function __construct(
         private readonly MysqlLink|PostgresLink $link,
         ?Dialect $dialect = null,
@@ -123,13 +130,79 @@ final class Query
      * $link->execute() always goes through MySQL/Postgres's own prepared-
      * statement protocol (a real PREPARE round-trip before EXECUTE), even
      * for a query with nothing to bind — $link->query() skips that
-     * entirely for the common case of no bound parameters at all.
+     * entirely, both for the no-params case and, via inlineLiterals()
+     * below, for a query whose params are all safe to write directly into
+     * the SQL text instead of binding. A prepared statement only pays for
+     * itself when reused; a fresh Query is built and executed exactly
+     * once, so it never gets the chance.
      *
      * @param list<mixed> $params
      */
     private function run(string $sql, array $params): MysqlResult|PostgresResult
     {
-        return $params === [] ? $this->link->query($sql) : $this->link->execute($sql, $params);
+        if ($params === []) {
+            return $this->link->query($sql);
+        }
+
+        $inlined = $this->inlineLiterals($sql, $params);
+
+        return $inlined !== null ? $this->link->query($inlined) : $this->link->execute($sql, $params);
+    }
+
+    /**
+     * Every "?" this class emits itself (where()/whereIn()/insert()/
+     * update()) has exactly one corresponding entry pushed onto its
+     * bindings at the same time, in the same left-to-right order — see
+     * this class's own docblock. That invariant is what makes a plain,
+     * positional "replace each ? with its value" substitution safe:
+     * there's no other source of a literal "?" character to collide with,
+     * *unless* whereRaw()/selectRaw()/orderByRaw() contributed raw SQL
+     * text of their own — caller-supplied text this class can't parse,
+     * which might contain a "?" that was never meant as a placeholder
+     * (inside a quoted string, say). $hasRawFragment rules that out
+     * entirely rather than trying to tell a real placeholder from a decoy
+     * one; a raw-fragment query always falls back to execute(), unchanged
+     * from before this existed.
+     *
+     * Returns null (falling back to execute()) when inlining doesn't
+     * apply — a raw fragment was used, or any single value in $params
+     * isn't safely inlinable as a literal (Dialect::literalFor() already
+     * covers per-value type/charset safety; the internal-error case above
+     * covers this method's own placeholder-count invariant).
+     *
+     * @param list<mixed> $params
+     */
+    private function inlineLiterals(string $sql, array $params): ?string
+    {
+        if ($this->hasRawFragment) {
+            return null;
+        }
+
+        $literals = [];
+
+        foreach ($params as $param) {
+            $literal = $this->dialect->literalFor($param, $this->link);
+
+            if ($literal === null) {
+                return null;
+            }
+
+            $literals[] = $literal;
+        }
+
+        $parts = explode('?', $sql);
+
+        if (count($parts) - 1 !== count($literals)) {
+            return null;
+        }
+
+        $result = $parts[0];
+
+        foreach ($literals as $i => $literal) {
+            $result .= $literal . $parts[$i + 1];
+        }
+
+        return $result;
     }
 
     public function table(string $table): static
@@ -156,6 +229,7 @@ final class Query
     public function selectRaw(string $sql): static
     {
         $this->selectRawExpressions[] = $sql;
+        $this->hasRawFragment = true;
 
         return $this;
     }
@@ -206,6 +280,7 @@ final class Query
     public function whereRaw(string $sql, array $params = [], string $boolean = 'AND'): static
     {
         $this->wheres[] = ['type' => 'raw', 'sql' => $sql, 'params' => $params, 'boolean' => $boolean];
+        $this->hasRawFragment = true;
 
         return $this;
     }
@@ -234,6 +309,7 @@ final class Query
     public function orderByRaw(string $sql): static
     {
         $this->orders[] = $sql;
+        $this->hasRawFragment = true;
 
         return $this;
     }
