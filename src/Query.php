@@ -9,24 +9,24 @@ use Kinetis\Http\Pagination\Paginator;
 use Kinetis\QueryBuilder\Dialect\MySqlDialect;
 use Kinetis\QueryBuilder\Dialect\PostgresDialect;
 use Kinetis\Validation\Hydrator;
-use Amp\Mysql\MysqlLink;
-use Amp\Mysql\MysqlResult;
-use Amp\Postgres\PostgresLink;
-use Amp\Postgres\PostgresResult;
+use Kinetis\Persistence\Contract\MysqlLink;
+use Kinetis\Persistence\Contract\PostgresLink;
+use Kinetis\Persistence\Contract\SqlResult;
 use InvalidArgumentException;
 
 /**
  * A thin, parameterized SQL query builder — not an ORM. No relationships,
  * no migrations, no change-tracking, no save()-on-a-model. Works with
- * either MySQL or Postgres through the shared Amp\Sql\SqlLink interface,
- * exactly like Kinetis\Persistence\TransactionGuard already does — one
+ * either MySQL or Postgres through the shared
+ * Kinetis\Persistence\Contract\SqlLink interface, exactly like
+ * Kinetis\Persistence\TransactionGuard already does — one
  * class, not one package per backend (see detectDialect()): the two
  * backends only genuinely differ on identifier quoting and how a
  * generated primary key is retrieved after an INSERT, both isolated in
  * Dialect, not spread through this class.
  *
- * $link accepts a plain connection pool *or* an in-flight
- * Amp\Sql\SqlTransaction — both implement SqlLink — so a Query composes
+ * $link accepts a plain driver client *or* an in-flight
+ * SqlTransaction — both implement SqlLink — so a Query composes
  * directly inside TransactionGuard::transaction()'s callback with no new
  * transaction concept of its own:
  *
@@ -138,7 +138,7 @@ final class Query
      *
      * @param list<mixed> $params
      */
-    private function run(string $sql, array $params): MysqlResult|PostgresResult
+    private function run(string $sql, array $params): SqlResult
     {
         if ($params === []) {
             return $this->link->query($sql);
@@ -181,7 +181,7 @@ final class Query
         $literals = [];
 
         foreach ($params as $param) {
-            $literal = $this->dialect->literalFor($param, $this->link);
+            $literal = $this->dialect->literalFor($param);
 
             if ($literal === null) {
                 return null;

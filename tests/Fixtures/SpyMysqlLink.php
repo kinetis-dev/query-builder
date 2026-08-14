@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder\Tests\Fixtures;
 
-use Kinetis\Persistence\Contract\PostgresLink;
+use Kinetis\Persistence\Contract\MysqlLink;
 use Kinetis\Persistence\Contract\SqlResult;
 use Kinetis\Persistence\Contract\SqlTransaction;
 use LogicException;
@@ -14,7 +14,7 @@ use LogicException;
  * to observe *which* of the two Query::run() actually chose, and with
  * what final SQL, not just to satisfy the constructor's type.
  */
-final class SpyPostgresLink implements PostgresLink
+final class SpyMysqlLink implements MysqlLink
 {
     /** @var list<RecordedCall> */
     public array $calls = [];
@@ -35,7 +35,7 @@ final class SpyPostgresLink implements PostgresLink
 
     public function beginTransaction(): SqlTransaction
     {
-        throw new LogicException('SpyPostgresLink does not support transactions.');
+        throw new LogicException('SpyMysqlLink does not support transactions.');
     }
 
     public function close(): void
