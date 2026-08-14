@@ -1,6 +1,6 @@
 {
     "name": "kinetis/query-builder",
-    "description": "A thin, parameterized SQL query builder for Kinetis — MySQL and Postgres via amphp, row-to-DTO mapping via Kinetis\\Validation\\Hydrator. Not an ORM: no relationships, no migrations, no change-tracking.",
+    "description": "A thin, parameterized SQL query builder for Kinetis — MySQL and Postgres via kinetis/persistence's drivers, row-to-DTO mapping via Kinetis\\Validation\\Hydrator. Not an ORM: no relationships, no migrations, no change-tracking.",
     "type": "library",
     "license": "MIT",
     "authors": [
@@ -18,9 +18,6 @@
         "phpstan/phpstan": "^2.2",
         "phpunit/phpunit": "^11.0",
         "vimeo/psalm": "^6.16"
-    },
-    "suggest": {
-        "ext-pgsql": "Needed by amphp/postgres to actually connect — amphp/mysql is a pure-PHP wire-protocol client and needs no extension, but amphp/postgres wraps a real Postgres client library. pecl-pq is the alternative. Not hard-required here for the same reason amphp/postgres itself doesn't hard-require it: forcing this on MySQL-only or Postgres-less deployments would be overly restrictive."
     },
     "autoload": {
         "psr-4": {

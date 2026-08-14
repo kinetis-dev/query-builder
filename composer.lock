@@ -74,7 +74,7 @@
             "dist": {
                 "type": "path",
                 "url": "../framework",
-                "reference": "a39db5bb4ee0075dc2b92677752dca436ecf3471"
+                "reference": "4948a3e9e7f40441def7ed4a1280c6f622857191"
             },
             "require": {
                 "ext-fileinfo": "*",
@@ -98,7 +98,7 @@
                 "vimeo/psalm": "^6.16"
             },
             "suggest": {
-                "ext-uv": "Lets Revolt's event loop use libuv instead of a select()-backed driver limited to 1024 file descriptors."
+                "ext-event": "An OS-native Revolt event-loop backend (epoll), removing select()'s 1024 fd-number ceiling. Needed when the loop watches real sockets (native Postgres driver, Redis, HTTP client) in a FrankenPHP worker process; a MySQL-only deployment does not need it. ext-uv/ext-ev work equally."
             },
             "bin": [
                 "bin/kinetis"
@@ -136,7 +136,7 @@
             "dist": {
                 "type": "path",
                 "url": "../persistence",
-                "reference": "d5fe3b60f6daf70de942cb6cb4dc058dee2133f7"
+                "reference": "807a8951c21e3d2aa51b90e79807b5cbd9652050"
             },
             "require": {
                 "kinetis/framework": "dev-main",
@@ -154,7 +154,7 @@
                 "ext-mysqli": "Needed by the native MySQL driver (Kinetis\\Persistence\\Driver\\MysqliAsyncClient) — the default under FrankenPHP worker mode via DB_DRIVER=auto.",
                 "ext-pdo_mysql": "Needed by the PDO MySQL driver (Kinetis\\Persistence\\Driver\\PdoMysqlClient) — the default under PHP-FPM via DB_DRIVER=auto.",
                 "ext-pdo_pgsql": "Needed by the PDO Postgres driver (Kinetis\\Persistence\\Driver\\PdoPgsqlClient) — the default under PHP-FPM via DB_DRIVER=auto.",
-                "ext-pgsql": "Needed by the native Postgres driver (Kinetis\\Persistence\\Driver\\PgsqlAsyncClient — the default under FrankenPHP worker mode via DB_DRIVER=auto) and by amphp/postgres."
+                "ext-pgsql": "Needed by the native Postgres driver (Kinetis\\Persistence\\Driver\\PgsqlAsyncClient) — the default under FrankenPHP worker mode via DB_DRIVER=auto."
             },
             "type": "library",
             "autoload": {
