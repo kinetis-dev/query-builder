@@ -13,10 +13,8 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use Amp\Mysql\MysqlConfig;
-use Amp\Mysql\MysqlConnectionPool;
-use Amp\Postgres\PostgresConfig;
-use Amp\Postgres\PostgresConnectionPool;
+use Kinetis\Persistence\Driver\MysqliAsyncClient;
+use Kinetis\Persistence\Driver\PgsqlAsyncClient;
 use Kinetis\QueryBuilder\Query;
 
 function check(string $label, bool $condition): void
@@ -93,18 +91,20 @@ function run(string $backend, $link): void
     echo "\n";
 }
 
-$mysql = new MysqlConnectionPool(new MysqlConfig(
-    host: getenv('MYSQL_HOST') ?: '127.0.0.1',
-    user: getenv('MYSQL_USER') ?: 'testuser',
-    password: getenv('MYSQL_PASSWORD') ?: 'testpass',
-    database: getenv('MYSQL_DATABASE') ?: 'testdb',
-));
-$postgres = new PostgresConnectionPool(new PostgresConfig(
-    host: getenv('POSTGRES_HOST') ?: '127.0.0.1',
-    user: getenv('POSTGRES_USER') ?: 'testuser',
-    password: getenv('POSTGRES_PASSWORD') ?: 'testpass',
-    database: getenv('POSTGRES_DATABASE') ?: 'testdb',
-));
+$mysql = new MysqliAsyncClient(
+    getenv('MYSQL_HOST') ?: '127.0.0.1',
+    getenv('MYSQL_USER') ?: 'testuser',
+    getenv('MYSQL_PASSWORD') ?: 'testpass',
+    getenv('MYSQL_DATABASE') ?: 'testdb',
+    (int) (getenv('MYSQL_PORT') ?: 3306),
+);
+$postgres = new PgsqlAsyncClient(
+    getenv('POSTGRES_HOST') ?: '127.0.0.1',
+    getenv('POSTGRES_USER') ?: 'testuser',
+    getenv('POSTGRES_PASSWORD') ?: 'testpass',
+    getenv('POSTGRES_DATABASE') ?: 'testdb',
+    (int) (getenv('POSTGRES_PORT') ?: 5432),
+);
 
 run('MySQL', $mysql);
 run('Postgres', $postgres);
