@@ -22,6 +22,15 @@ final class PostgresDialect implements Dialect
     #[\Override]
     public function quoteIdentifier(string $identifier): string
     {
+        // Fast path for the overwhelmingly common shape — a plain,
+        // unqualified identifier with nothing to escape. Identifier
+        // quoting runs several times per compiled query, so the
+        // explode/array_map/implode machinery below is reserved for
+        // identifiers that actually need it.
+        if (!str_contains($identifier, '.') && !str_contains($identifier, '"')) {
+            return '"' . $identifier . '"';
+        }
+
         return implode('.', array_map(
             static fn (string $part): string => '"' . str_replace('"', '""', $part) . '"',
             explode('.', $identifier),
