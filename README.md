@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://packagist.org/packages/kinetis/query-builder"><img src="https://img.shields.io/packagist/v/kinetis/query-builder" alt="Packagist Version"></a>
+  <a href="https://packagist.org/packages/kinetis/query-builder"><img src="https://img.shields.io/packagist/v/kinetis/query-builder?label=version" alt="Packagist Version"></a>
   <a href="https://packagist.org/packages/kinetis/query-builder"><img src="https://img.shields.io/packagist/dt/kinetis/query-builder" alt="Packagist Downloads"></a>
   <a href="https://packagist.org/packages/kinetis/query-builder"><img src="https://img.shields.io/packagist/php-v/kinetis/query-builder" alt="PHP Version"></a>
   <a href="https://packagist.org/packages/kinetis/query-builder"><img src="https://img.shields.io/packagist/l/kinetis/query-builder" alt="License"></a>
