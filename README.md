@@ -8,6 +8,14 @@
   <strong>A thin, parameterized SQL query builder for Kinetis</strong>
 </p>
 
+<p align="center">
+  <a href="https://packagist.org/packages/kinetis/query-builder"><img src="https://img.shields.io/packagist/v/kinetis/query-builder" alt="Packagist Version"></a>
+  <a href="https://packagist.org/packages/kinetis/query-builder"><img src="https://img.shields.io/packagist/dt/kinetis/query-builder" alt="Packagist Downloads"></a>
+  <a href="https://packagist.org/packages/kinetis/query-builder"><img src="https://img.shields.io/packagist/php-v/kinetis/query-builder" alt="PHP Version"></a>
+  <a href="https://packagist.org/packages/kinetis/query-builder"><img src="https://img.shields.io/packagist/l/kinetis/query-builder" alt="License"></a>
+  <a href="https://github.com/kinetis-dev/kinetis/actions/workflows/ci.yml"><img src="https://github.com/kinetis-dev/kinetis/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
+
 ---
 
 MySQL and Postgres via `amphp/mysql`/`amphp/postgres`, with row-to-DTO
