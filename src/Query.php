@@ -55,10 +55,10 @@ use InvalidArgumentException;
 final class Query
 {
     /**
-     * where()'s $operator, orderBy()'s $direction, and join()'s $type were
-     * previously interpolated into SQL verbatim, unlike every other
-     * user-reachable slot in this class — a real SQL injection point an
-     * independent security review found, since a sortable/filterable API
+     * where()'s $operator, orderBy()'s $direction, and join()'s $type are
+     * interpolated into SQL verbatim, unlike every other user-reachable
+     * slot in this class — left unchecked, that is a real SQL injection
+     * point, since a sortable/filterable API
      * (`?sort=name&dir=asc&op=gte`) is exactly the shape that passes these
      * through from a request. Allow-listing them here is a construction-
      * time boundary, the same shape as CorsMiddleware/AsGlobalMiddleware's
@@ -161,8 +161,7 @@ final class Query
      * which might contain a "?" that was never meant as a placeholder
      * (inside a quoted string, say). $hasRawFragment rules that out
      * entirely rather than trying to tell a real placeholder from a decoy
-     * one; a raw-fragment query always falls back to execute(), unchanged
-     * from before this existed.
+     * one; a raw-fragment query always falls back to execute().
      *
      * Returns null (falling back to execute()) when inlining doesn't
      * apply — a raw fragment was used, or any single value in $params
