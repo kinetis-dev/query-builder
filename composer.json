@@ -10,8 +10,8 @@
     ],
     "require": {
         "php": "^8.4",
-        "kinetis/framework": "dev-main",
-        "kinetis/persistence": "dev-main"
+        "kinetis/framework": "^1.6",
+        "kinetis/persistence": "^1.7"
     },
     "require-dev": {
         "infection/infection": "^0.34.2",
@@ -32,16 +32,6 @@
     "extra": {
         "kinetis": {}
     },
-    "repositories": [
-        {
-            "type": "path",
-            "url": "../framework"
-        },
-        {
-            "type": "path",
-            "url": "../persistence"
-        }
-    ],
     "config": {
         "sort-packages": true,
         "allow-plugins": {
