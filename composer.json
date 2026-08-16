@@ -29,6 +29,9 @@
             "Kinetis\\QueryBuilder\\Tests\\": "tests/"
         }
     },
+    "extra": {
+        "kinetis": {}
+    },
     "repositories": [
         {
             "type": "path",

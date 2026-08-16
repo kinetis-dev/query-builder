@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "2d01d48d493c1cc0c4408048660c7643",
+    "content-hash": "c6b2b49ddfa5ba70aac33d9548a42efd",
     "packages": [
         {
             "name": "graham-campbell/result-type",
@@ -74,7 +74,7 @@
             "dist": {
                 "type": "path",
                 "url": "../framework",
-                "reference": "4948a3e9e7f40441def7ed4a1280c6f622857191"
+                "reference": "0de7f8938cf33a41a31bb8d347a7a95cfe8fd535"
             },
             "require": {
                 "ext-fileinfo": "*",
@@ -104,6 +104,9 @@
                 "bin/kinetis"
             ],
             "type": "library",
+            "extra": {
+                "kinetis": []
+            },
             "autoload": {
                 "psr-4": {
                     "Kinetis\\": "src/"
@@ -136,7 +139,7 @@
             "dist": {
                 "type": "path",
                 "url": "../persistence",
-                "reference": "807a8951c21e3d2aa51b90e79807b5cbd9652050"
+                "reference": "211618fd0a388b935cc726d8a363b415c8b761cb"
             },
             "require": {
                 "kinetis/framework": "dev-main",
@@ -157,6 +160,11 @@
                 "ext-pgsql": "Needed by the native Postgres driver (Kinetis\\Persistence\\Driver\\PgsqlAsyncClient) — the default under FrankenPHP worker mode via DB_DRIVER=auto."
             },
             "type": "library",
+            "extra": {
+                "kinetis": {
+                    "bootstrap": "Kinetis\\Persistence\\PackageBootstrap"
+                }
+            },
             "autoload": {
                 "psr-4": {
                     "Kinetis\\Persistence\\": "src/"
@@ -7203,6 +7211,6 @@
     "platform": {
         "php": "^8.4"
     },
-    "platform-dev": [],
-    "plugin-api-version": "2.6.0"
+    "platform-dev": {},
+    "plugin-api-version": "2.9.0"
 }
