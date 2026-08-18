@@ -11,6 +11,7 @@ use Kinetis\QueryBuilder\Dialect\PostgresDialect;
 use Kinetis\Validation\Hydrator;
 use Kinetis\Persistence\Contract\MysqlLink;
 use Kinetis\Persistence\Contract\PostgresLink;
+use Kinetis\Persistence\Contract\PrefersPreparedStatements;
 use Kinetis\Persistence\Contract\SqlResult;
 use InvalidArgumentException;
 
@@ -127,14 +128,16 @@ final class Query
     }
 
     /**
-     * $link->execute() always goes through MySQL/Postgres's own prepared-
-     * statement protocol (a real PREPARE round-trip before EXECUTE), even
-     * for a query with nothing to bind — $link->query() skips that
-     * entirely, both for the no-params case and, via inlineLiterals()
-     * below, for a query whose params are all safe to write directly into
-     * the SQL text instead of binding. A prepared statement only pays for
-     * itself when reused; a fresh Query is built and executed exactly
-     * once, so it never gets the chance.
+     * $link->execute() goes through the server's prepared-statement
+     * protocol; $link->query() does not. A query with nothing to bind
+     * therefore always takes query(), and one whose parameters are all
+     * safe to write into the SQL text may — see inlineLiterals(), which
+     * decides on the driver rather than on this class.
+     *
+     * A fresh Query is built and executed once, so it never reuses a
+     * prepared statement itself. Whether one is reused at all is the
+     * driver's business: the PDO drivers memoize per connection and get
+     * that reuse across Query instances, the native drivers do not.
      *
      * @param list<mixed> $params
      */
@@ -173,6 +176,16 @@ final class Query
      */
     private function inlineLiterals(string $sql, array $params): ?string
     {
+        // Whether writing a value into the SQL beats binding it is a
+        // property of the driver. The native drivers reach the server
+        // once for an unparameterized query and twice for a prepared
+        // one; the PDO drivers memoize the prepared statement and keep
+        // the binary protocol, where the same substitution costs about
+        // half again as much per query. They say so themselves.
+        if ($this->link instanceof PrefersPreparedStatements) {
+            return null;
+        }
+
         if ($this->hasRawFragment) {
             return null;
         }

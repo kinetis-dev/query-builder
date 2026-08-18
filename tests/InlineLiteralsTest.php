@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Kinetis\QueryBuilder\Tests;
 
 use Kinetis\QueryBuilder\Query;
+use Kinetis\QueryBuilder\Tests\Fixtures\PreparingSpyMysqlLink;
+use Kinetis\QueryBuilder\Tests\Fixtures\PreparingSpyPostgresLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\SpyMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\SpyPostgresLink;
 use PHPUnit\Framework\TestCase;
@@ -169,5 +171,50 @@ final class InlineLiteralsTest extends TestCase
         new Query($spy)->table('items')->where('id', '=', 1)->whereRaw('extra = ?', [2])->get();
 
         self::assertSame('execute', $spy->calls[0]->method);
+    }
+
+    public function test_a_driver_preferring_prepared_statements_binds_instead_of_inlining(): void
+    {
+        // Same query as the first test in this file, same dialect, same
+        // int: only the marker differs, and it is enough to choose the
+        // other path.
+        $spy = new PreparingSpyMysqlLink();
+        new Query($spy)->table('items')->where('id', '=', 42)->get();
+
+        self::assertCount(1, $spy->calls);
+        self::assertSame('execute', $spy->calls[0]->method);
+        self::assertSame('SELECT * FROM `items` WHERE `id` = ?', $spy->calls[0]->sql);
+        self::assertSame([42], $spy->calls[0]->params);
+    }
+
+    public function test_the_same_holds_on_postgres(): void
+    {
+        $spy = new PreparingSpyPostgresLink();
+        new Query($spy)->table('items')->where('id', '=', 42)->get();
+
+        self::assertSame('execute', $spy->calls[0]->method);
+        self::assertSame('SELECT * FROM "items" WHERE "id" = ?', $spy->calls[0]->sql);
+        self::assertSame([42], $spy->calls[0]->params);
+    }
+
+    public function test_a_query_with_nothing_to_bind_still_takes_query(): void
+    {
+        // The marker only governs whether a *parameter* is inlined. A
+        // query that never had one has nothing to prepare either way.
+        $spy = new PreparingSpyMysqlLink();
+        new Query($spy)->table('items')->get();
+
+        self::assertSame('query', $spy->calls[0]->method);
+        self::assertSame('SELECT * FROM `items`', $spy->calls[0]->sql);
+    }
+
+    public function test_an_update_binds_every_value_for_such_a_driver(): void
+    {
+        $spy = new PreparingSpyMysqlLink();
+        new Query($spy)->table('items')->where('id', '=', 7)->update(['votes' => 3]);
+
+        self::assertSame('execute', $spy->calls[0]->method);
+        self::assertSame('UPDATE `items` SET `votes` = ? WHERE `id` = ?', $spy->calls[0]->sql);
+        self::assertSame([3, 7], $spy->calls[0]->params);
     }
 }
