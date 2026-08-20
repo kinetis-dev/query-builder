@@ -56,22 +56,27 @@ use InvalidArgumentException;
 final class Query
 {
     /**
-     * where()'s $operator, orderBy()'s $direction, and join()'s $type are
-     * interpolated into SQL verbatim, unlike every other user-reachable
-     * slot in this class — left unchecked, that is a real SQL injection
-     * point, since a sortable/filterable API
-     * (`?sort=name&dir=asc&op=gte`) is exactly the shape that passes these
-     * through from a request. Allow-listing them here is a construction-
-     * time boundary, the same shape as CorsMiddleware/AsGlobalMiddleware's
-     * own constructor guards — every other value/identifier in this class
-     * was already safe by construction (bound as "?" or identifier-quoted);
-     * this closes the one place that wasn't.
+     * where()'s $operator, orderBy()'s $direction, join()'s $type, and
+     * where()/whereIn()/whereRaw()'s $boolean are interpolated into SQL
+     * verbatim, unlike every other user-reachable slot in this class —
+     * left unchecked, that is a real SQL injection point, since a
+     * sortable/filterable API (`?sort=name&dir=asc&op=gte`) is exactly the
+     * shape that passes these through from a request, and a generic
+     * "match any/all of these filters" builder is exactly the shape that
+     * passes $boolean through the same way. Allow-listing them here is a
+     * construction-time boundary, the same shape as
+     * CorsMiddleware/AsGlobalMiddleware's own constructor guards — every
+     * other value/identifier in this class was already safe by
+     * construction (bound as "?" or identifier-quoted); this closes the
+     * places that weren't.
      */
     private const array ALLOWED_WHERE_OPERATORS = ['=', '!=', '<>', '<', '<=', '>', '>=', 'LIKE', 'NOT LIKE'];
 
     private const array ALLOWED_ORDER_DIRECTIONS = ['ASC', 'DESC'];
 
     private const array ALLOWED_JOIN_TYPES = ['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS'];
+
+    private const array ALLOWED_WHERE_BOOLEANS = ['AND', 'OR'];
 
     private readonly Dialect $dialect;
 
@@ -252,7 +257,8 @@ final class Query
     public function where(string $column, string $operator, mixed $value, string $boolean = 'AND'): static
     {
         $normalizedOperator = self::assertAllowedOperator($operator);
-        $this->wheres[] = ['type' => 'basic', 'column' => $column, 'operator' => $normalizedOperator, 'value' => $value, 'boolean' => $boolean];
+        $normalizedBoolean = self::assertAllowedBoolean($boolean);
+        $this->wheres[] = ['type' => 'basic', 'column' => $column, 'operator' => $normalizedOperator, 'value' => $value, 'boolean' => $normalizedBoolean];
 
         return $this;
     }
@@ -274,7 +280,8 @@ final class Query
      */
     public function whereIn(string $column, array $values, string $boolean = 'AND'): static
     {
-        $this->wheres[] = ['type' => 'in', 'column' => $column, 'values' => $values, 'boolean' => $boolean];
+        $normalizedBoolean = self::assertAllowedBoolean($boolean);
+        $this->wheres[] = ['type' => 'in', 'column' => $column, 'values' => $values, 'boolean' => $normalizedBoolean];
 
         return $this;
     }
@@ -291,7 +298,8 @@ final class Query
      */
     public function whereRaw(string $sql, array $params = [], string $boolean = 'AND'): static
     {
-        $this->wheres[] = ['type' => 'raw', 'sql' => $sql, 'params' => $params, 'boolean' => $boolean];
+        $normalizedBoolean = self::assertAllowedBoolean($boolean);
+        $this->wheres[] = ['type' => 'raw', 'sql' => $sql, 'params' => $params, 'boolean' => $normalizedBoolean];
         $this->hasRawFragment = true;
 
         return $this;
@@ -606,6 +614,23 @@ final class Query
             );
         }
 
+        return $normalized;
+    }
+
+    /**
+     * @return 'AND'|'OR'
+     */
+    private static function assertAllowedBoolean(string $boolean): string
+    {
+        $normalized = strtoupper(trim($boolean));
+
+        if (!in_array($normalized, self::ALLOWED_WHERE_BOOLEANS, true)) {
+            throw new InvalidArgumentException(
+                "Where boolean \"{$boolean}\" is not allowed. Use one of: " . implode(', ', self::ALLOWED_WHERE_BOOLEANS) . '.',
+            );
+        }
+
+        /** @var 'AND'|'OR' $normalized */
         return $normalized;
     }
 

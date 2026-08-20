@@ -272,6 +272,27 @@ final class QueryTest extends TestCase
         $this->mysql()->table('orders')->join('customers', 'orders.customer_id', '1=1; DROP TABLE users --', 'customers.id');
     }
 
+    public function test_a_where_boolean_injection_attempt_is_rejected(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        $this->mysql()->table('users')->where('tenant_id', '=', 7)->where('active', '=', 1, 'OR 1=1 OR');
+    }
+
+    public function test_a_where_in_boolean_injection_attempt_is_rejected(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        $this->mysql()->table('users')->where('tenant_id', '=', 7)->whereIn('id', [1, 2], 'OR 1=1 OR');
+    }
+
+    public function test_a_where_raw_boolean_injection_attempt_is_rejected(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        $this->mysql()->table('users')->where('tenant_id', '=', 7)->whereRaw('active = 1', [], 'OR 1=1 OR');
+    }
+
     public function test_an_allowed_where_operator_still_works_case_insensitively(): void
     {
         $compiled = $this->mysql()->table('users')->where('name', 'like', '%alon%')->toSelectSql();
@@ -290,6 +311,24 @@ final class QueryTest extends TestCase
             'SELECT * FROM `orders` LEFT JOIN `customers` ON `orders`.`customer_id` = `customers`.`id`',
             $compiled->sql,
         );
+    }
+
+    public function test_an_allowed_where_boolean_still_works_case_insensitively(): void
+    {
+        $compiled = $this->mysql()->table('users')
+            ->where('tenant_id', '=', 7)
+            ->where('active', '=', 1, 'or')
+            ->toSelectSql();
+
+        self::assertSame('SELECT * FROM `users` WHERE `tenant_id` = ? OR `active` = ?', $compiled->sql);
+        self::assertSame([7, 1], $compiled->params);
+    }
+
+    public function test_a_postgres_where_boolean_injection_attempt_is_rejected(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        $this->postgres()->table('users')->where('tenant_id', '=', 7)->where('active', '=', 1, 'OR 1=1 OR');
     }
 
     public function test_where_in_with_an_empty_array_compiles_to_a_constant_false_predicate(): void
