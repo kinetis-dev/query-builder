@@ -13,8 +13,8 @@ use Kinetis\Persistence\Contract\MysqlLink;
 use Kinetis\Persistence\Contract\PostgresLink;
 use Kinetis\Persistence\Contract\PrefersPreparedStatements;
 use Kinetis\Persistence\Contract\SqlResult;
+use Kinetis\QueryBuilder\Exception\QueryBuilderException;
 use InvalidArgumentException;
-use RuntimeException;
 
 /**
  * A thin, parameterized SQL query builder — not an ORM. No relationships,
@@ -515,25 +515,8 @@ final class Query
         ?string $dtoClass = null,
         ?string $cursorAlias = null,
     ): CursorPaginator {
-        if ($perPage < 1) {
-            throw new InvalidArgumentException("cursorPaginate() needs a perPage of at least 1, got {$perPage}.");
-        }
-
         $cursorColumnIsQualified = str_contains($cursorColumn, '.');
-
-        if ($cursorColumnIsQualified && $cursorAlias === null) {
-            throw new InvalidArgumentException(
-                "cursorPaginate() needs a \$cursorAlias for the qualified cursor column \"{$cursorColumn}\": both "
-                . 'MySQL and Postgres report it under its bare name, which another selected column of that same '
-                . 'name would silently overwrite in the returned row. Pass a name nothing else in the projection '
-                . 'uses — cursorAlias: \'' . str_replace('.', '_', $cursorColumn) . '\', say — and the cursor is '
-                . 'read from that and stripped back out before the rows are returned.',
-            );
-        }
-
-        if ($cursorAlias !== null) {
-            self::assertAliasIsFreeInProjection($this->selectColumns, $cursorAlias);
-        }
+        $this->assertCursorPaginateArguments($perPage, $cursorColumn, $cursorAlias, $cursorColumnIsQualified);
 
         if ($cursor !== null) {
             $this->where($cursorColumn, '>', $cursor);
@@ -565,27 +548,7 @@ final class Query
             array_pop($rows);
         }
 
-        $nextCursor = null;
-
-        if ($hasMore && $rows !== []) {
-            $lastRow = $rows[array_key_last($rows)];
-
-            // Not a collision check: a colliding alias *takes* the key
-            // rather than vacating it, so nothing here could see one. It
-            // catches the different failure of a cursor column that never
-            // reached the result at all, which would otherwise report a
-            // silently null cursor. assertAliasIsFreeInProjection() is
-            // what rules out the collisions that are visible at all.
-            if (!array_key_exists($cursorRowKey, $lastRow)) {
-                throw new RuntimeException(
-                    "cursorPaginate() could not read \"{$cursorRowKey}\" back off the row it just returned. "
-                    . 'The cursor column has to reach the result under exactly that name for its value to be '
-                    . 'readable.',
-                );
-            }
-
-            $nextCursor = (string) $lastRow[$cursorRowKey];
-        }
+        $nextCursor = self::nextCursorFromRow($rows, $hasMore, $cursorRowKey);
 
         if (!$projectionIncludesCursorColumn) {
             $rows = array_map(
@@ -603,6 +566,63 @@ final class Query
             : $rows;
 
         return new CursorPaginator($data, $nextCursor, $hasMore);
+    }
+
+    /**
+     * cursorPaginate()'s own argument-validation prefix, extracted for
+     * cognitive complexity — three independent, unrelated failure modes
+     * (an out-of-range perPage, a qualified cursor column with no alias
+     * to disambiguate it, an alias that collides with a column the
+     * caller already selected), each a guard clause with nothing left
+     * to share with the other two.
+     */
+    private function assertCursorPaginateArguments(
+        int $perPage,
+        string $cursorColumn,
+        ?string $cursorAlias,
+        bool $cursorColumnIsQualified,
+    ): void {
+        if ($perPage < 1) {
+            throw new InvalidArgumentException("cursorPaginate() needs a perPage of at least 1, got {$perPage}.");
+        }
+
+        if ($cursorColumnIsQualified && $cursorAlias === null) {
+            throw new InvalidArgumentException(
+                "cursorPaginate() needs a \$cursorAlias for the qualified cursor column \"{$cursorColumn}\": both "
+                . 'MySQL and Postgres report it under its bare name, which another selected column of that same '
+                . 'name would silently overwrite in the returned row. Pass a name nothing else in the projection '
+                . 'uses — cursorAlias: \'' . str_replace('.', '_', $cursorColumn) . '\', say — and the cursor is '
+                . 'read from that and stripped back out before the rows are returned.',
+            );
+        }
+
+        if ($cursorAlias !== null) {
+            self::assertAliasIsFreeInProjection($this->selectColumns, $cursorAlias);
+        }
+    }
+
+    /**
+     * @param list<array<string, mixed>> $rows
+     */
+    private static function nextCursorFromRow(array $rows, bool $hasMore, string $cursorRowKey): ?string
+    {
+        if (!$hasMore || $rows === []) {
+            return null;
+        }
+
+        $lastRow = $rows[array_key_last($rows)];
+
+        // Not a collision check: a colliding alias *takes* the key
+        // rather than vacating it, so nothing here could see one. It
+        // catches the different failure of a cursor column that never
+        // reached the result at all, which would otherwise report a
+        // silently null cursor. assertAliasIsFreeInProjection() is what
+        // rules out the collisions that are visible at all.
+        if (!array_key_exists($cursorRowKey, $lastRow)) {
+            throw QueryBuilderException::cursorColumnMissingFromRow($cursorRowKey);
+        }
+
+        return (string) $lastRow[$cursorRowKey];
     }
 
     /**
