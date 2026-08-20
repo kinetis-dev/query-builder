@@ -14,6 +14,7 @@ use Kinetis\Persistence\Contract\PostgresLink;
 use Kinetis\Persistence\Contract\PrefersPreparedStatements;
 use Kinetis\Persistence\Contract\SqlResult;
 use InvalidArgumentException;
+use RuntimeException;
 
 /**
  * A thin, parameterized SQL query builder — not an ORM. No relationships,
@@ -87,6 +88,20 @@ final class Query
 
     /** @var list<string> */
     private array $selectRawExpressions = [];
+
+    /**
+     * An already-quoted `expr AS alias` fragment appended to the compiled
+     * SELECT list, set only for the duration of one
+     * {@see toSelectSqlWithCursorAlias()} call and cleared in its own
+     * finally — never state a later call on this instance can observe.
+     * Separate from $selectRawExpressions above because that one is
+     * subject to compileSelectColumns()'s "drop the default wildcard once
+     * something explicit was asked for" rule, which is right for a
+     * caller's own selectRaw() and wrong here: appending a cursor alias
+     * must never silently take `*` away from a projection the caller
+     * never touched.
+     */
+    private ?string $cursorAliasExpression = null;
 
     /**
      * @var list<
@@ -336,6 +351,10 @@ final class Query
 
     public function limit(int $limit): static
     {
+        if ($limit < 0) {
+            throw new InvalidArgumentException("limit() must be 0 or greater, got {$limit}.");
+        }
+
         $this->limitValue = $limit;
 
         return $this;
@@ -343,6 +362,10 @@ final class Query
 
     public function offset(int $offset): static
     {
+        if ($offset < 0) {
+            throw new InvalidArgumentException("offset() must be 0 or greater, got {$offset}.");
+        }
+
         $this->offsetValue = $offset;
 
         return $this;
@@ -401,6 +424,14 @@ final class Query
      */
     public function paginate(int $perPage, int $page = 1, ?string $dtoClass = null): Paginator
     {
+        if ($perPage < 1) {
+            throw new InvalidArgumentException("paginate() needs a perPage of at least 1, got {$perPage}.");
+        }
+
+        if ($page < 1) {
+            throw new InvalidArgumentException("paginate() needs a page of at least 1, got {$page}.");
+        }
+
         $total = $this->count();
         $data = $this->limit($perPage)->offset(($page - 1) * $perPage)->get($dtoClass);
 
@@ -409,7 +440,9 @@ final class Query
             currentPage: $page,
             perPage: $perPage,
             total: $total,
-            lastPage: $perPage > 0 ? (int) ceil($total / $perPage) : 0,
+            // perPage is validated at least 1 above, so this division is
+            // always well-defined.
+            lastPage: (int) ceil($total / $perPage),
         );
     }
 
@@ -423,20 +456,100 @@ final class Query
      * WHERE $cursorColumn > ? comparison only makes sense against the
      * column results are actually ordered by.
      *
+     * $cursorColumn must be unique and strictly monotonic (a primary key
+     * or an auto-incrementing/serial column, not e.g. created_at, which
+     * two rows can share) — a page boundary landing inside a run of equal
+     * values silently skips whatever's left of that run, since
+     * `WHERE cursorColumn > ?` only ever excludes rows up to and
+     * including the exact value already seen, not "rows already seen."
+     *
      * Fetches rows as plain arrays first, regardless of $dtoClass, so the
      * next cursor is read off the real column name — a hydrated DTO's own
      * property name isn't guaranteed to match it. $dtoClass, when given,
      * only affects what ends up in the returned data.
      *
+     * The cursor value always comes out of the same result as the
+     * delivered rows — never a second query. Two reads of a live table
+     * are not one snapshot: a row inserted or deleted between them moves
+     * the boundary, and a cursor naming a row the caller was never handed
+     * silently skips whatever sits between the two. One query cannot
+     * disagree with itself.
+     *
+     * That makes the cursor column's own *row key* the whole problem, and
+     * $cursorAlias is how a caller settles it. Both MySQL and Postgres
+     * report an unaliased qualified column (`orders.id`) under its bare
+     * name (`id`), which a join can trivially collide with — and a PHP
+     * associative row has no way to hold two values under one key, so the
+     * colliding pair silently becomes one. There is no alias spelling
+     * this class could pick that is *guaranteed* absent from an arbitrary
+     * `*` or explicit select(), so it does not guess one: pass
+     * $cursorAlias and the column is additionally selected under exactly
+     * that name, read back from it, and stripped from every returned row
+     * (never reaching $dtoClass hydration) before this returns. A
+     * qualified $cursorColumn without one is refused rather than guessed
+     * at.
+     *
+     * Choosing a name nothing else in the projection uses is the
+     * caller's, exactly as it is for any `AS` they write themselves —
+     * {@see assertAliasIsFreeInProjection()} rejects the half of that
+     * mistake which is visible from the builder (a column the caller
+     * listed by name), and its own docblock covers why a wildcard's
+     * contents cannot be checked the same way.
+     *
+     * An unqualified $cursorColumn needs no alias, since its own name is
+     * already the row key: it is added to the projection only when a
+     * caller's own select() chose specific columns that don't include it
+     * — never when select() wasn't called at all (the default `*` already
+     * covers it) or when the caller already selected it themselves — and
+     * stripped back out only when this method is the one that added it.
+     * Passing $cursorAlias for one is still allowed, and is the way to
+     * disambiguate a projection that already has a *different* column of
+     * that name.
+     *
      * @param class-string|null $dtoClass
      */
-    public function cursorPaginate(int $perPage, ?string $cursor, string $cursorColumn = 'id', ?string $dtoClass = null): CursorPaginator
-    {
+    public function cursorPaginate(
+        int $perPage,
+        ?string $cursor,
+        string $cursorColumn = 'id',
+        ?string $dtoClass = null,
+        ?string $cursorAlias = null,
+    ): CursorPaginator {
+        if ($perPage < 1) {
+            throw new InvalidArgumentException("cursorPaginate() needs a perPage of at least 1, got {$perPage}.");
+        }
+
+        $cursorColumnIsQualified = str_contains($cursorColumn, '.');
+
+        if ($cursorColumnIsQualified && $cursorAlias === null) {
+            throw new InvalidArgumentException(
+                "cursorPaginate() needs a \$cursorAlias for the qualified cursor column \"{$cursorColumn}\": both "
+                . 'MySQL and Postgres report it under its bare name, which another selected column of that same '
+                . 'name would silently overwrite in the returned row. Pass a name nothing else in the projection '
+                . 'uses — cursorAlias: \'' . str_replace('.', '_', $cursorColumn) . '\', say — and the cursor is '
+                . 'read from that and stripped back out before the rows are returned.',
+            );
+        }
+
+        if ($cursorAlias !== null) {
+            self::assertAliasIsFreeInProjection($this->selectColumns, $cursorAlias);
+        }
+
         if ($cursor !== null) {
             $this->where($cursorColumn, '>', $cursor);
         }
 
-        $compiled = $this->orderBy($cursorColumn)->limit($perPage + 1)->toSelectSql();
+        // Only ever true for an *unqualified* column, whose own name is
+        // the row key: a qualified one always arrives here aliased.
+        $projectionIncludesCursorColumn = $cursorAlias === null
+            && ($this->selectColumns === ['*'] || in_array($cursorColumn, $this->selectColumns, true));
+
+        if ($cursorAlias === null && !$projectionIncludesCursorColumn) {
+            $this->selectColumns[] = $cursorColumn;
+        }
+
+        $cursorRowKey = $cursorAlias ?? $cursorColumn;
+        $compiled = $this->orderBy($cursorColumn)->limit($perPage + 1)->toSelectSqlWithCursorAlias($cursorColumn, $cursorAlias);
         $result = $this->run($compiled->sql, $compiled->params);
 
         /** @var list<array<string, mixed>> $rows */
@@ -456,7 +569,33 @@ final class Query
 
         if ($hasMore && $rows !== []) {
             $lastRow = $rows[array_key_last($rows)];
-            $nextCursor = (string) $lastRow[$cursorColumn];
+
+            // Not a collision check: a colliding alias *takes* the key
+            // rather than vacating it, so nothing here could see one. It
+            // catches the different failure of a cursor column that never
+            // reached the result at all, which would otherwise report a
+            // silently null cursor. assertAliasIsFreeInProjection() is
+            // what rules out the collisions that are visible at all.
+            if (!array_key_exists($cursorRowKey, $lastRow)) {
+                throw new RuntimeException(
+                    "cursorPaginate() could not read \"{$cursorRowKey}\" back off the row it just returned. "
+                    . 'The cursor column has to reach the result under exactly that name for its value to be '
+                    . 'readable.',
+                );
+            }
+
+            $nextCursor = (string) $lastRow[$cursorRowKey];
+        }
+
+        if (!$projectionIncludesCursorColumn) {
+            $rows = array_map(
+                static function (array $row) use ($cursorRowKey): array {
+                    unset($row[$cursorRowKey]);
+
+                    return $row;
+                },
+                $rows,
+            );
         }
 
         $data = $dtoClass !== null
@@ -467,10 +606,93 @@ final class Query
     }
 
     /**
+     * Rejects a $cursorAlias that a column the caller listed themselves
+     * already answers to, before any SQL runs.
+     *
+     * A collision is genuinely destructive rather than merely confusing:
+     * a PHP row is an associative array, so the appended cursor column
+     * takes the key its namesake would have occupied, and the cleanup
+     * that removes the alias afterwards removes the caller's own field
+     * with it. Nothing downstream can notice — the appended value is
+     * *present* under that key, so a presence check passes, and the row
+     * simply comes back one field short.
+     *
+     * What this can see is the explicit projection: `select('row_cursor')`
+     * names its own bare key, and `select('t.row_cursor')` resolves to
+     * the same one, since both engines report a qualified column under
+     * its last segment. What it cannot see is a wildcard's contents or an
+     * alias buried in a selectRaw() expression — neither is knowable
+     * without asking the server for column metadata, which SqlResult does
+     * not carry. Those stay the caller's own precondition, documented as
+     * such rather than promised as a check: a count of distinct keys
+     * against the server's column count would catch them, but it also
+     * fires on the ordinary duplicate `id` of any `SELECT *` across a
+     * join — a false rejection of the single most common reason to reach
+     * for a cursor alias at all.
+     *
+     * @param list<string> $selectColumns
+     */
+    private static function assertAliasIsFreeInProjection(array $selectColumns, string $cursorAlias): void
+    {
+        foreach ($selectColumns as $column) {
+            if ($column === '*' || str_ends_with($column, '.*')) {
+                continue;
+            }
+
+            $bareName = str_contains($column, '.') ? substr($column, (int) strrpos($column, '.') + 1) : $column;
+
+            if ($bareName === $cursorAlias) {
+                throw new InvalidArgumentException(
+                    "cursorPaginate()'s \$cursorAlias \"{$cursorAlias}\" is already the name of a column this "
+                    . "query selects (\"{$column}\"). The cursor is selected under that alias and stripped back "
+                    . 'out afterwards, so sharing the name would drop the column you asked for. Pick a name '
+                    . 'nothing else in the projection uses.',
+                );
+            }
+        }
+    }
+
+    /**
+     * {@see toSelectSql()}, with $cursorColumn additionally selected
+     * under $cursorAlias when one was given — the projection the caller
+     * asked for, plus exactly one column this class reads its own cursor
+     * back from.
+     *
+     * Everything else about the query is left alone: an alias an
+     * orderBy() depends on stays in the projection that created it, and
+     * a caller's own offset() stays exactly as they set it. Appending is
+     * the only change, which is what lets the delivered rows and the
+     * cursor come out of one result rather than two.
+     */
+    private function toSelectSqlWithCursorAlias(string $cursorColumn, ?string $cursorAlias): CompiledQuery
+    {
+        if ($cursorAlias === null) {
+            return $this->toSelectSql();
+        }
+
+        $this->cursorAliasExpression = $this->dialect->quoteIdentifier($cursorColumn)
+            . ' AS ' . $this->dialect->quoteIdentifier($cursorAlias);
+
+        try {
+            return $this->toSelectSql();
+        } finally {
+            $this->cursorAliasExpression = null;
+        }
+    }
+
+    /**
      * @param array<string, mixed> $data
      */
     public function insert(array $data): void
     {
+        if ($data === []) {
+            throw new InvalidArgumentException(
+                'insert() needs at least one column — an empty array compiles to invalid SQL '
+                . '("INSERT INTO t () VALUES ()"). Pass the columns you want set to their default '
+                . 'values explicitly if that\'s the intent; this class has no DEFAULT VALUES shorthand.',
+            );
+        }
+
         $columns = array_keys($data);
 
         $sql = sprintf(
@@ -488,6 +710,12 @@ final class Query
      */
     public function insertGetId(array $data, string $primaryKey = 'id'): int|string|null
     {
+        if ($data === []) {
+            throw new InvalidArgumentException(
+                'insertGetId() needs at least one column — an empty array compiles to invalid SQL.',
+            );
+        }
+
         $compiled = $this->dialect->insertGetIdQuery($this->table, $data, $primaryKey);
         $result = $this->run($compiled->sql, $compiled->params);
 
@@ -555,6 +783,13 @@ final class Query
      */
     public function toUpdateSql(array $data): CompiledQuery
     {
+        if ($data === []) {
+            throw new InvalidArgumentException(
+                'update() needs at least one column — an empty array compiles to invalid SQL '
+                . '("UPDATE t SET  WHERE ...").',
+            );
+        }
+
         $sets = implode(', ', array_map(
             fn (string $column) => $this->dialect->quoteIdentifier($column) . ' = ?',
             array_keys($data),
@@ -637,16 +872,53 @@ final class Query
     /**
      * The default "*" is dropped once anything explicit — select() or
      * selectRaw() — has actually been specified; only the untouched
-     * default ever produces a bare "*".
+     * default ever produces a bare "*". More precisely: the ternary
+     * below drops the default "*" once a real selectRaw() expression
+     * exists and select() was never explicitly called — a caller
+     * reaching only for selectRaw('COUNT(*) AS total') wants exactly
+     * that, not also every column via the untouched default. Once
+     * select() has been called, $selectColumns is no longer literally
+     * ['*'], so the ternary's condition is false and whatever was
+     * explicitly selected is combined with the raw expressions normally.
      */
     private function compileSelectColumns(): string
     {
         $quoted = array_map(
-            fn (string $c) => $c === '*' ? $c : $this->dialect->quoteIdentifier($c),
+            $this->compileSelectColumn(...),
             $this->selectColumns === ['*'] && $this->selectRawExpressions !== [] ? [] : $this->selectColumns,
         );
 
-        return implode(', ', [...$quoted, ...$this->selectRawExpressions]);
+        $expressions = [...$quoted, ...$this->selectRawExpressions];
+
+        // Appended after that ternary, deliberately: a cursor alias is
+        // this class's own addition, not something the caller asked to
+        // see, so it must never be what turns an untouched `*` into an
+        // explicit projection.
+        if ($this->cursorAliasExpression !== null) {
+            $expressions[] = $this->cursorAliasExpression;
+        }
+
+        return implode(', ', $expressions);
+    }
+
+    /**
+     * The bare wildcard and a qualified one ("orders.*") both stay
+     * unquoted on their "*" segment — quoteIdentifier() would otherwise
+     * quote it as a literal column named "*" (`` `orders`.`*` `` on
+     * MySQL), which the server rejects outright rather than expanding to
+     * every column, since that's genuinely a different thing to ask for.
+     */
+    private function compileSelectColumn(string $column): string
+    {
+        if ($column === '*') {
+            return $column;
+        }
+
+        if (str_ends_with($column, '.*')) {
+            return $this->dialect->quoteIdentifier(substr($column, 0, -2)) . '.*';
+        }
+
+        return $this->dialect->quoteIdentifier($column);
     }
 
     private function compileWheres(): CompiledQuery

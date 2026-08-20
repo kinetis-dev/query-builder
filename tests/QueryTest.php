@@ -9,7 +9,12 @@ use Kinetis\QueryBuilder\Dialect\PostgresDialect;
 use Kinetis\QueryBuilder\Query;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakeMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakePostgresLink;
+use Kinetis\QueryBuilder\Tests\Fixtures\QueuedRowsMysqlLink;
+use Kinetis\QueryBuilder\Tests\Fixtures\QueuedSqlResult;
+use Kinetis\QueryBuilder\Tests\Fixtures\SpyMysqlLink;
+use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
+use RuntimeException;
 
 final class QueryTest extends TestCase
 {
@@ -356,5 +361,358 @@ final class QueryTest extends TestCase
 
         self::assertSame('SELECT * FROM `users` WHERE `id` IN (?, ?, ?)', $compiled->sql);
         self::assertSame([1, 2, 3], $compiled->params);
+    }
+
+    public function test_a_qualified_wildcard_leaves_the_star_segment_unquoted(): void
+    {
+        self::assertSame(
+            'SELECT `orders`.* FROM `orders`',
+            $this->mysql()->table('orders')->select('orders.*')->toSelectSql()->sql,
+        );
+        self::assertSame(
+            'SELECT "orders".* FROM "orders"',
+            $this->postgres()->table('orders')->select('orders.*')->toSelectSql()->sql,
+        );
+    }
+
+    public function test_a_qualified_wildcard_can_be_combined_with_other_columns(): void
+    {
+        self::assertSame(
+            'SELECT `orders`.*, `users`.`name` FROM `orders`',
+            $this->mysql()->table('orders')->select('orders.*', 'users.name')->toSelectSql()->sql,
+        );
+    }
+
+    public function test_limit_rejects_a_negative_value(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('limit() must be 0 or greater, got -1.');
+
+        $this->mysql()->table('users')->limit(-1);
+    }
+
+    public function test_limit_of_zero_is_allowed(): void
+    {
+        self::assertSame(
+            'SELECT * FROM `users` LIMIT 0',
+            $this->mysql()->table('users')->limit(0)->toSelectSql()->sql,
+        );
+    }
+
+    public function test_offset_rejects_a_negative_value(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('offset() must be 0 or greater, got -5.');
+
+        $this->mysql()->table('users')->offset(-5);
+    }
+
+    public function test_paginate_rejects_a_non_positive_per_page(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('paginate() needs a perPage of at least 1, got 0.');
+
+        $this->mysql()->table('users')->paginate(0);
+    }
+
+    public function test_paginate_rejects_a_non_positive_page(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('paginate() needs a page of at least 1, got 0.');
+
+        $this->mysql()->table('users')->paginate(10, 0);
+    }
+
+    public function test_cursor_paginate_rejects_a_non_positive_per_page(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('cursorPaginate() needs a perPage of at least 1, got 0.');
+
+        $this->mysql()->table('users')->cursorPaginate(0, null);
+    }
+
+    /**
+     * cursorPaginate() reads nextCursor off the real cursor column in
+     * every row it fetches — that column has to actually be in the
+     * SELECT list for that to work at all, regardless of what the
+     * caller's own projection asked to see. Verified here purely at the
+     * "what SQL did Query actually send" level, against a spy rather
+     * than a real database — asserting on returned row data (does the
+     * added column get stripped back out again) needs real execution,
+     * which this class's own established discipline leaves to
+     * real-backend verification rather than a mocked PHPUnit test.
+     */
+    public function test_cursor_paginate_adds_the_cursor_column_to_a_projection_that_omits_it(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('users')->select('name')->cursorPaginate(20, null, cursorColumn: 'id');
+
+        self::assertCount(1, $spy->calls);
+        self::assertSame(
+            'SELECT `name`, `id` FROM `users` ORDER BY `id` ASC LIMIT 21',
+            $spy->calls[0]->sql,
+        );
+    }
+
+    public function test_cursor_paginate_does_not_duplicate_the_cursor_column_when_the_projection_already_has_it(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('users')->select('id', 'name')->cursorPaginate(20, null, cursorColumn: 'id');
+
+        self::assertSame(
+            'SELECT `id`, `name` FROM `users` ORDER BY `id` ASC LIMIT 21',
+            $spy->calls[0]->sql,
+        );
+    }
+
+    public function test_cursor_paginate_does_not_touch_the_default_wildcard_projection(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('users')->cursorPaginate(20, null, cursorColumn: 'id');
+
+        self::assertSame(
+            'SELECT * FROM `users` ORDER BY `id` ASC LIMIT 21',
+            $spy->calls[0]->sql,
+        );
+    }
+    /**
+     * A qualified cursor column is reported by both MySQL and Postgres
+     * under its bare name, which a join can collide with — so it is
+     * additionally selected under the caller-supplied alias, appended to
+     * whatever projection they already asked for rather than replacing
+     * it.
+     */
+    public function test_cursor_paginate_appends_the_caller_supplied_alias_for_a_qualified_column(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('orders')->select('name')
+            ->cursorPaginate(20, null, cursorColumn: 'orders.id', cursorAlias: 'order_cursor');
+
+        self::assertSame(
+            'SELECT `name`, `orders`.`id` AS `order_cursor` FROM `orders` ORDER BY `orders`.`id` ASC LIMIT 21',
+            $spy->calls[0]->sql,
+        );
+    }
+
+    /**
+     * A cursor alias must never be what turns an untouched wildcard into
+     * an explicit projection — compileSelectColumns() drops the default
+     * "*" once something explicit exists, and the alias is appended
+     * after that rule rather than through it.
+     */
+    public function test_cursor_paginate_keeps_the_default_wildcard_alongside_the_alias(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('orders')
+            ->cursorPaginate(20, null, cursorColumn: 'orders.id', cursorAlias: 'order_cursor');
+
+        self::assertSame(
+            'SELECT *, `orders`.`id` AS `order_cursor` FROM `orders` ORDER BY `orders`.`id` ASC LIMIT 21',
+            $spy->calls[0]->sql,
+        );
+    }
+
+    /**
+     * Guessing a row key for a qualified column is what silently lost a
+     * same-named application column, so it is refused instead — with the
+     * message naming the parameter that settles it.
+     */
+    public function test_cursor_paginate_refuses_a_qualified_column_with_no_alias(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        // The complete message, not a substring: a partial assertion
+        // leaves the rest of the sentence — including the suggested
+        // alias it derives — free to rot unnoticed.
+        $this->expectExceptionMessage(
+            'cursorPaginate() needs a $cursorAlias for the qualified cursor column "orders.id": both MySQL and '
+            . 'Postgres report it under its bare name, which another selected column of that same name would '
+            . 'silently overwrite in the returned row. Pass a name nothing else in the projection uses — '
+            . "cursorAlias: 'orders_id', say — and the cursor is read from that and stripped back out before "
+            . 'the rows are returned.',
+        );
+
+        new Query(new SpyMysqlLink())->table('orders')->cursorPaginate(20, null, cursorColumn: 'orders.id');
+    }
+
+    /**
+     * The cursor comes out of the same result as the delivered rows —
+     * one query, never two, which is what makes it impossible for the
+     * cursor to name a row the caller was not handed. Asserted on the
+     * recorded call count as much as on the value.
+     */
+    public function test_cursor_paginate_reads_the_cursor_from_the_delivered_row_in_one_query(): void
+    {
+        $link = new QueuedRowsMysqlLink([
+            new QueuedSqlResult([
+                ['name' => 'a', 'order_cursor' => 7],
+                ['name' => 'b', 'order_cursor' => 8],
+            ]),
+        ]);
+
+        $page = new Query($link)->table('orders')->select('name')
+            ->cursorPaginate(1, null, cursorColumn: 'orders.id', cursorAlias: 'order_cursor');
+
+        self::assertCount(1, $link->calls, 'The cursor must not cost a second round trip.');
+        self::assertTrue($page->hasMore);
+        self::assertSame('7', $page->nextCursor);
+        self::assertSame([['name' => 'a']], $page->data, 'The alias must be stripped from the returned rows.');
+    }
+
+    /**
+     * A caller's own offset() is part of the query cursorPaginate()
+     * paginates, and reading the cursor from the delivered row is what
+     * keeps the two consistent: the cursor names the row that was
+     * actually returned, whatever offset shifted the window to.
+     */
+    public function test_cursor_paginate_honours_a_caller_supplied_offset(): void
+    {
+        $link = new QueuedRowsMysqlLink([
+            new QueuedSqlResult([
+                ['id' => 2, 'order_cursor' => 2],
+                ['id' => 3, 'order_cursor' => 3],
+            ]),
+        ]);
+
+        $page = new Query($link)->table('orders')->offset(1)
+            ->cursorPaginate(1, null, cursorColumn: 'orders.id', cursorAlias: 'order_cursor');
+
+        self::assertStringContainsString('OFFSET 1', $link->calls[0]->sql);
+        self::assertSame([['id' => 2]], $page->data);
+        self::assertSame('2', $page->nextCursor, 'The cursor must name the row actually delivered.');
+    }
+
+    /**
+     * An alias created by selectRaw() and ordered by is a legal query
+     * this must not break: the projection that defines the alias has to
+     * still be there when the ORDER BY referring to it runs.
+     */
+    public function test_cursor_paginate_keeps_a_projection_alias_its_own_order_by_depends_on(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('orders')->select('id', 'name')->selectRaw('id * 2 AS rank_value')
+            ->orderBy('rank_value')
+            ->cursorPaginate(1, null, cursorColumn: 'orders.id', cursorAlias: 'order_cursor');
+
+        self::assertCount(1, $spy->calls);
+        self::assertStringContainsString('id * 2 AS rank_value', $spy->calls[0]->sql);
+        self::assertStringContainsString('`rank_value`', $spy->calls[0]->sql);
+    }
+
+    /**
+     * An alias is equally available for an *unqualified* column, which
+     * is how a caller disambiguates a projection that already carries a
+     * different column of that name.
+     */
+    public function test_cursor_paginate_accepts_an_alias_for_an_unqualified_column_too(): void
+    {
+        $link = new QueuedRowsMysqlLink([
+            new QueuedSqlResult([
+                ['id' => 'theirs', 'own_cursor' => 1],
+                ['id' => 'theirs', 'own_cursor' => 2],
+            ]),
+        ]);
+
+        $page = new Query($link)->table('orders')
+            ->cursorPaginate(1, null, cursorColumn: 'id', cursorAlias: 'own_cursor');
+
+        self::assertSame('1', $page->nextCursor);
+        self::assertSame([['id' => 'theirs']], $page->data);
+    }
+
+    /**
+     * A collision is destructive rather than confusing — the appended
+     * cursor takes the key, and the cleanup that removes the alias
+     * removes the caller's own column with it — and nothing after the
+     * query can notice, since the key is present either way. The half of
+     * it that is visible from the builder is refused before any SQL
+     * runs.
+     */
+    public function test_cursor_paginate_refuses_an_alias_a_listed_column_already_answers_to(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(
+            'cursorPaginate()\'s $cursorAlias "row_cursor" is already the name of a column this query selects '
+            . '("row_cursor"). The cursor is selected under that alias and stripped back out afterwards, so '
+            . 'sharing the name would drop the column you asked for. Pick a name nothing else in the projection '
+            . 'uses.',
+        );
+
+        new Query(new SpyMysqlLink())->table('orders')->select('id', 'row_cursor')
+            ->cursorPaginate(20, null, cursorColumn: 'orders.id', cursorAlias: 'row_cursor');
+    }
+
+    /**
+     * Both engines report a qualified column under its last segment, so
+     * select('t.row_cursor') claims the same key as select('row_cursor')
+     * and collides just as destructively.
+     */
+    public function test_cursor_paginate_refuses_an_alias_a_qualified_listed_column_answers_to(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('is already the name of a column this query selects ("orders.row_cursor")');
+
+        new Query(new SpyMysqlLink())->table('orders')->select('orders.row_cursor')
+            ->cursorPaginate(20, null, cursorColumn: 'orders.id', cursorAlias: 'row_cursor');
+    }
+
+    /**
+     * A wildcard is not a column the builder can read, so it must not be
+     * mistaken for one — rejecting on its presence would refuse every
+     * default projection.
+     */
+    public function test_cursor_paginate_does_not_mistake_a_wildcard_for_a_colliding_column(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('orders')->select('*', 'orders.*')
+            ->cursorPaginate(20, null, cursorColumn: 'orders.id', cursorAlias: 'row_cursor');
+
+        self::assertStringContainsString('AS `row_cursor`', $spy->calls[0]->sql);
+    }
+
+    /**
+     * An alias the projection swallowed (a caller who picked a name
+     * something else already claims) leaves no key to read the cursor
+     * from — a clear error rather than a silently null cursor.
+     */
+    public function test_cursor_paginate_throws_when_the_alias_is_missing_from_the_returned_row(): void
+    {
+        $link = new QueuedRowsMysqlLink([
+            new QueuedSqlResult([
+                ['name' => 'a'],
+                ['name' => 'b'],
+            ]),
+        ]);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage(
+            'cursorPaginate() could not read "order_cursor" back off the row it just returned. The cursor '
+            . 'column has to reach the result under exactly that name for its value to be readable.',
+        );
+
+        new Query($link)->table('orders')
+            ->cursorPaginate(1, null, cursorColumn: 'orders.id', cursorAlias: 'order_cursor');
+    }
+    public function test_insert_rejects_an_empty_data_array(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('insert() needs at least one column');
+
+        $this->mysql()->table('users')->insert([]);
+    }
+
+    public function test_insert_get_id_rejects_an_empty_data_array(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('insertGetId() needs at least one column');
+
+        $this->mysql()->table('users')->insertGetId([]);
+    }
+
+    public function test_update_rejects_an_empty_data_array(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('update() needs at least one column');
+
+        $this->mysql()->table('users')->toUpdateSql([]);
     }
 }
