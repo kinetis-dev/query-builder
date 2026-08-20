@@ -47,7 +47,7 @@ composer require kinetis/query-builder
 ```
 
 Requires PHP 8.4+ and `kinetis/framework`. Full documentation:
-[docs.kinetis.dev/query-builder.html](https://docs.kinetis.dev/query-builder.html).
+[kinetis.dev/docs/query-builder.html](https://kinetis.dev/docs/query-builder.html).
 
 ## License
 
