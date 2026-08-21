@@ -6,6 +6,7 @@ namespace Kinetis\QueryBuilder\Tests;
 
 use Kinetis\QueryBuilder\Dialect\MySqlDialect;
 use Kinetis\QueryBuilder\Dialect\PostgresDialect;
+use Kinetis\QueryBuilder\Exception\InvalidPaginationException;
 use Kinetis\QueryBuilder\Query;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakeMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakePostgresLink;
@@ -409,15 +410,30 @@ final class QueryTest extends TestCase
 
     public function test_paginate_rejects_a_non_positive_per_page(): void
     {
-        $this->expectException(InvalidArgumentException::class);
+        $this->expectException(InvalidPaginationException::class);
         $this->expectExceptionMessage('paginate() needs a perPage of at least 1, got 0.');
 
         $this->mysql()->table('users')->paginate(0);
     }
 
+    /**
+     * A 400, not the generic 500 an uncaught InvalidArgumentException
+     * would otherwise reach ExceptionHandlerMiddleware as — see
+     * Kinetis\Http\Exception\HttpStatusExceptionInterface.
+     */
+    public function test_invalid_pagination_exception_declares_a_400_status(): void
+    {
+        try {
+            $this->mysql()->table('users')->paginate(0);
+            self::fail('paginate() was expected to throw.');
+        } catch (InvalidPaginationException $e) {
+            self::assertSame(400, $e->httpStatus());
+        }
+    }
+
     public function test_paginate_rejects_a_non_positive_page(): void
     {
-        $this->expectException(InvalidArgumentException::class);
+        $this->expectException(InvalidPaginationException::class);
         $this->expectExceptionMessage('paginate() needs a page of at least 1, got 0.');
 
         $this->mysql()->table('users')->paginate(10, 0);
@@ -425,7 +441,7 @@ final class QueryTest extends TestCase
 
     public function test_cursor_paginate_rejects_a_non_positive_per_page(): void
     {
-        $this->expectException(InvalidArgumentException::class);
+        $this->expectException(InvalidPaginationException::class);
         $this->expectExceptionMessage('cursorPaginate() needs a perPage of at least 1, got 0.');
 
         $this->mysql()->table('users')->cursorPaginate(0, null);
@@ -519,7 +535,7 @@ final class QueryTest extends TestCase
      */
     public function test_cursor_paginate_refuses_a_qualified_column_with_no_alias(): void
     {
-        $this->expectException(InvalidArgumentException::class);
+        $this->expectException(InvalidPaginationException::class);
         // The complete message, not a substring: a partial assertion
         // leaves the rest of the sentence — including the suggested
         // alias it derives — free to rot unnoticed.
@@ -629,7 +645,7 @@ final class QueryTest extends TestCase
      */
     public function test_cursor_paginate_refuses_an_alias_a_listed_column_already_answers_to(): void
     {
-        $this->expectException(InvalidArgumentException::class);
+        $this->expectException(InvalidPaginationException::class);
         $this->expectExceptionMessage(
             'cursorPaginate()\'s $cursorAlias "row_cursor" is already the name of a column this query selects '
             . '("row_cursor"). The cursor is selected under that alias and stripped back out afterwards, so '
@@ -648,7 +664,7 @@ final class QueryTest extends TestCase
      */
     public function test_cursor_paginate_refuses_an_alias_a_qualified_listed_column_answers_to(): void
     {
-        $this->expectException(InvalidArgumentException::class);
+        $this->expectException(InvalidPaginationException::class);
         $this->expectExceptionMessage('is already the name of a column this query selects ("orders.row_cursor")');
 
         new Query(new SpyMysqlLink())->table('orders')->select('orders.row_cursor')

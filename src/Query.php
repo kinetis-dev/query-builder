@@ -13,6 +13,7 @@ use Kinetis\Persistence\Contract\MysqlLink;
 use Kinetis\Persistence\Contract\PostgresLink;
 use Kinetis\Persistence\Contract\PrefersPreparedStatements;
 use Kinetis\Persistence\Contract\SqlResult;
+use Kinetis\QueryBuilder\Exception\InvalidPaginationException;
 use Kinetis\QueryBuilder\Exception\QueryBuilderException;
 use InvalidArgumentException;
 
@@ -425,11 +426,11 @@ final class Query
     public function paginate(int $perPage, int $page = 1, ?string $dtoClass = null): Paginator
     {
         if ($perPage < 1) {
-            throw new InvalidArgumentException("paginate() needs a perPage of at least 1, got {$perPage}.");
+            throw InvalidPaginationException::nonPositivePerPage('paginate()', $perPage);
         }
 
         if ($page < 1) {
-            throw new InvalidArgumentException("paginate() needs a page of at least 1, got {$page}.");
+            throw InvalidPaginationException::nonPositivePage($page);
         }
 
         $total = $this->count();
@@ -583,17 +584,11 @@ final class Query
         bool $cursorColumnIsQualified,
     ): void {
         if ($perPage < 1) {
-            throw new InvalidArgumentException("cursorPaginate() needs a perPage of at least 1, got {$perPage}.");
+            throw InvalidPaginationException::nonPositivePerPage('cursorPaginate()', $perPage);
         }
 
         if ($cursorColumnIsQualified && $cursorAlias === null) {
-            throw new InvalidArgumentException(
-                "cursorPaginate() needs a \$cursorAlias for the qualified cursor column \"{$cursorColumn}\": both "
-                . 'MySQL and Postgres report it under its bare name, which another selected column of that same '
-                . 'name would silently overwrite in the returned row. Pass a name nothing else in the projection '
-                . 'uses — cursorAlias: \'' . str_replace('.', '_', $cursorColumn) . '\', say — and the cursor is '
-                . 'read from that and stripped back out before the rows are returned.',
-            );
+            throw InvalidPaginationException::missingCursorAlias($cursorColumn);
         }
 
         if ($cursorAlias !== null) {
@@ -662,12 +657,7 @@ final class Query
             $bareName = str_contains($column, '.') ? substr($column, (int) strrpos($column, '.') + 1) : $column;
 
             if ($bareName === $cursorAlias) {
-                throw new InvalidArgumentException(
-                    "cursorPaginate()'s \$cursorAlias \"{$cursorAlias}\" is already the name of a column this "
-                    . "query selects (\"{$column}\"). The cursor is selected under that alias and stripped back "
-                    . 'out afterwards, so sharing the name would drop the column you asked for. Pick a name '
-                    . 'nothing else in the projection uses.',
-                );
+                throw InvalidPaginationException::cursorAliasCollision($cursorAlias, $column);
             }
         }
     }
