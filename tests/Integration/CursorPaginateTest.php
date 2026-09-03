@@ -8,6 +8,7 @@ use Kinetis\Persistence\Contract\MysqlLink;
 use Kinetis\Persistence\Contract\PostgresLink;
 use Kinetis\Persistence\Driver\MysqliAsyncClient;
 use Kinetis\Persistence\Driver\PgsqlAsyncClient;
+use Kinetis\QueryBuilder\Exception\InvalidPaginationException;
 use Kinetis\QueryBuilder\Query;
 use Kinetis\QueryBuilder\Tests\Fixtures\CursorReviewItem;
 use Kinetis\QueryBuilder\Tests\Fixtures\MutatingMysqlLink;
@@ -19,8 +20,11 @@ use PHPUnit\Framework\TestCase;
  * Real-backend regression coverage for cursorPaginate(): the cursor must
  * name the row that was actually delivered, and the caller's own
  * projection must come back exactly as they asked for it — including a
- * column that happens to share a name with anything internal, an alias
- * an ORDER BY depends on, and an offset() they set themselves.
+ * column that happens to share a name with anything internal. Also
+ * covers, against a real link rather than a fake, the query state
+ * cursorPaginate() refuses to combine with: a pre-existing
+ * orderBy()/orderByRaw() call, and a pre-existing offset() greater than
+ * zero — offset(0) is the one value proven accepted instead.
  *
  * Environment-gated (skips unless MYSQL_HOST/POSTGRES_HOST is set), so a
  * plain local `vendor/bin/phpunit` run stays database-free. CI's
@@ -173,55 +177,90 @@ final class CursorPaginateTest extends TestCase
     }
 
     /**
-     * A projection alias its own ORDER BY depends on used to be dropped
-     * by a follow-up query that kept the order list but cleared the
-     * projection defining it — valid SQL compiled into invalid SQL
-     * ("Unknown column 'rank_value' in 'order clause'"). One query cannot
-     * lose half of itself.
+     * cursorPaginate() refuses to combine its own cursor order with a
+     * caller-supplied orderBy() — including one a projection alias
+     * depends on. Proven against a real link, not just a fake: the
+     * rejection happens before any query reaches the database, and both
+     * the Query and the link are left fully usable afterward — get() on
+     * the same, untouched Query still runs its own orderBy() correctly.
      */
     #[DataProvider('backends')]
-    public function test_an_order_by_on_a_projection_alias_still_runs(string $backend): void
+    public function test_a_pre_existing_order_by_on_a_projection_alias_is_rejected_before_any_query_runs(string $backend): void
     {
         $link = self::makeLink($backend);
-        self::seed($link, $backend, 'kin_cursor_projection_alias');
+        self::seed($link, $backend, 'kin_cursor_order_conflict');
 
-        $page = new Query($link)->table('kin_cursor_projection_alias')
+        $query = new Query($link)->table('kin_cursor_order_conflict')
             ->select('id', 'name')
             ->selectRaw('id * 2 AS rank_value')
-            ->orderBy('rank_value')
-            ->cursorPaginate(1, null, 'kin_cursor_projection_alias.id', cursorAlias: 'row_cursor');
+            ->orderBy('rank_value');
 
-        self::assertCount(1, $page->data);
-        self::assertSame('n1', $page->data[0]['name']);
-        self::assertSame(2, (int) $page->data[0]['rank_value']);
-        self::assertSame('1', $page->nextCursor);
+        try {
+            $query->cursorPaginate(1, null, 'kin_cursor_order_conflict.id', cursorAlias: 'row_cursor');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException) {
+            // The exception itself is the point; assertions continue below.
+        }
+
+        $rows = $query->get();
+
+        self::assertCount(2, $rows);
+        self::assertSame('n1', $rows[0]['name']);
+        self::assertSame(2, (int) $rows[0]['rank_value']);
 
         $link->close();
     }
 
     /**
-     * A caller's own offset() shifts which rows the page delivers, and
-     * the cursor has to follow it. The follow-up query used to overwrite
-     * offset with its own, reporting a cursor for a row the caller was
-     * never handed: offset(1) delivered id=2 but reported "1".
+     * A pre-existing offset() greater than zero is rejected before any
+     * query reaches the database — the reason: with offset(1) and
+     * perPage=1, a first cursorPaginate() call delivers row 2 and
+     * reports cursor "2", then a second call rebuilding the same query
+     * (offset(1) again, the real shape of a fresh Query per HTTP
+     * request) compiles WHERE id > 2 combined with OFFSET 1, silently
+     * skipping row 3. Proven against a real link, not just a fake: the
+     * rejection happens before any query runs, and both the Query and
+     * the link are left fully usable afterward.
      */
     #[DataProvider('backends')]
-    public function test_a_caller_supplied_offset_is_honoured_by_the_cursor(string $backend): void
+    public function test_a_pre_existing_positive_offset_is_rejected_before_any_query_runs(string $backend): void
     {
         $link = self::makeLink($backend);
-        self::seed($link, $backend, 'kin_cursor_offset', rows: 3);
+        self::seed($link, $backend, 'kin_cursor_offset', rows: 5);
 
-        $page = new Query($link)->table('kin_cursor_offset')
-            ->offset(1)
-            ->cursorPaginate(1, null, 'kin_cursor_offset.id', cursorAlias: 'row_cursor');
+        $query = new Query($link)->table('kin_cursor_offset')->offset(1);
+
+        try {
+            $query->cursorPaginate(1, null, 'kin_cursor_offset.id', cursorAlias: 'row_cursor');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException) {
+            // The exception itself is the point; assertions continue below.
+        }
+
+        $rows = new Query($link)->table('kin_cursor_offset')->where('id', '=', 3)->get();
+
+        self::assertCount(1, $rows);
+        self::assertSame('n3', $rows[0]['name']);
+
+        $link->close();
+    }
+
+    /**
+     * offset(0) is the one pre-existing offset value with no skip risk
+     * — it compiles to the same "skip nothing" SQL as no offset() call
+     * at all — so it is accepted and cursorPaginate() runs normally.
+     */
+    #[DataProvider('backends')]
+    public function test_a_pre_existing_zero_offset_is_accepted(string $backend): void
+    {
+        $link = self::makeLink($backend);
+        self::seed($link, $backend, 'kin_cursor_zero_offset', rows: 2);
+
+        $page = new Query($link)->table('kin_cursor_zero_offset')->offset(0)
+            ->cursorPaginate(1, null, 'kin_cursor_zero_offset.id', cursorAlias: 'row_cursor');
 
         self::assertCount(1, $page->data);
-        self::assertSame(2, (int) $page->data[0]['id']);
-        self::assertSame(
-            '2',
-            $page->nextCursor,
-            'The cursor must name the row delivered, not the one an ignored offset would have reached.',
-        );
+        self::assertSame('n1', $page->data[0]['name']);
 
         $link->close();
     }

@@ -18,6 +18,10 @@
 
 ---
 
+Part of [Kinetis](https://kinetis.dev/), a non-blocking PHP framework for
+API-first applications, developed in the
+[kinetis-dev/kinetis](https://github.com/kinetis-dev/kinetis) monorepo.
+
 MySQL and Postgres via `amphp/mysql`/`amphp/postgres`, with row-to-DTO
 mapping via `Kinetis\Validation\Hydrator` — the same mechanism that
 hydrates a `#[Body]` request DTO. Not an ORM: no relationships, no
@@ -46,7 +50,9 @@ you pass in — and composes directly inside
 composer require kinetis/query-builder
 ```
 
-Requires PHP 8.4+ and `kinetis/framework`. Full documentation:
+Requires PHP 8.4+, [`kinetis/framework`](https://github.com/kinetis-dev/framework),
+and [`kinetis/persistence`](https://github.com/kinetis-dev/persistence).
+Full documentation:
 [kinetis.dev/docs/query-builder.html](https://kinetis.dev/docs/query-builder.html).
 
 ## License

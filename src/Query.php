@@ -433,8 +433,28 @@ final class Query
             throw InvalidPaginationException::nonPositivePage($page);
         }
 
+        // (page - 1) * perPage never fails at the multiplication itself —
+        // PHP silently promotes an overflowing product to float — so the
+        // failure this guards against is offset(int)'s own strict type,
+        // which would otherwise throw a raw TypeError only after count()
+        // has already queried the database. Checked here, before either
+        // runs, against the same arithmetic offset() will receive.
+        $offset = ($page - 1) * $perPage;
+
+        // PHPStan's own arithmetic modeling doesn't represent integer
+        // overflow at all — it infers $offset stays int purely from
+        // $page/$perPage's own static int types, with no way to know PHP
+        // itself would silently widen an overflowing product to float.
+        // This is exactly the real case the comment above exists to
+        // guard against, so the check stays even though PHPStan can't
+        // see why it's ever reachable.
+        // @phpstan-ignore-next-line function.alreadyNarrowedType
+        if (!is_int($offset)) {
+            throw InvalidPaginationException::offsetOverflow($page, $perPage);
+        }
+
         $total = $this->count();
-        $data = $this->limit($perPage)->offset(($page - 1) * $perPage)->get($dtoClass);
+        $data = $this->limit($perPage)->offset($offset)->get($dtoClass);
 
         return new Paginator(
             data: $data,
@@ -451,11 +471,24 @@ final class Query
      * Cursor-based pagination: no COUNT(*), no page number — advances by
      * the last row's own $cursorColumn value instead of an offset, so
      * rows inserted/deleted between calls can't shift results the way
-     * offset pagination's page N can. Always orders by $cursorColumn
-     * itself; combining this with an additional orderBy() call on a
-     * different column can make pagination skip or repeat rows, since the
-     * WHERE $cursorColumn > ? comparison only makes sense against the
-     * column results are actually ordered by.
+     * offset pagination's page N can. Owns the whole query state that
+     * would otherwise conflict with that cursor: always orders by
+     * $cursorColumn itself, so an orderBy()/orderByRaw() call already
+     * made on this Query — on $cursorColumn or any other column — throws
+     * InvalidPaginationException rather than silently compiling a
+     * WHERE $cursorColumn > ? comparison that no longer describes the
+     * order results actually come back in. Always computes its own
+     * limit from perPage, so a pre-existing limit() throws the same way.
+     * A pre-existing offset() greater than zero throws too: cursor
+     * pagination has no offset concept of its own, and the value would
+     * be reapplied inside every cursor window on every call rather than
+     * applied once before the sequence starts, silently skipping rows
+     * as soon as a caller advances past the first page — offset(0) is
+     * the one value with no such risk and is accepted. Pagination by a
+     * different or composite ordering, or by an initial skip, needs its
+     * own cursor design, which this method does not provide; call it on
+     * a Query with no orderBy()/orderByRaw()/limit() calls and no
+     * offset() beyond zero of your own.
      *
      * $cursorColumn must be unique and strictly monotonic (a primary key
      * or an auto-incrementing/serial column, not e.g. created_at, which
@@ -571,11 +604,21 @@ final class Query
 
     /**
      * cursorPaginate()'s own argument-validation prefix, extracted for
-     * cognitive complexity — three independent, unrelated failure modes
-     * (an out-of-range perPage, a qualified cursor column with no alias
-     * to disambiguate it, an alias that collides with a column the
-     * caller already selected), each a guard clause with nothing left
-     * to share with the other two.
+     * cognitive complexity — seven independent, unrelated failure modes
+     * (an out-of-range perPage, a perPage whose look-ahead cannot fit a
+     * native int, a pre-existing orderBy()/orderByRaw() this method's
+     * own cursor order would conflict with, a pre-existing offset()
+     * greater than zero the cursor's own windowing would silently
+     * reapply on every call, a pre-existing limit() this method's own
+     * perPage-derived limit would conflict with, a qualified cursor
+     * column with no alias to disambiguate it, an alias that collides
+     * with a column the caller already selected), each a guard clause
+     * with nothing left to share with the other six. Runs entirely
+     * before cursorPaginate() itself makes its first mutation to $this
+     * (where()/selectColumns/orderBy()/limit()), so a rejection here
+     * always leaves the query exactly as the caller built it — never a
+     * partially-applied cursor filter, projection change, order, or
+     * window.
      */
     private function assertCursorPaginateArguments(
         int $perPage,
@@ -585,6 +628,61 @@ final class Query
     ): void {
         if ($perPage < 1) {
             throw InvalidPaginationException::nonPositivePerPage('cursorPaginate()', $perPage);
+        }
+
+        // perPage + 1 never fails at the addition itself — PHP silently
+        // promotes an overflowing sum to float — so the failure this
+        // guards against is limit(int)'s own strict type, which would
+        // otherwise throw a raw TypeError only after where()/
+        // selectColumns have already been mutated below. Checked here,
+        // against the same arithmetic the look-ahead fetch will receive.
+        // PHPStan infers $perPage + 1 stays int purely from $perPage's own
+        // static range type, with no model of real integer overflow — see
+        // the identical reasoning on paginate()'s own overflow check above.
+        // @phpstan-ignore-next-line function.alreadyNarrowedType
+        if (!is_int($perPage + 1)) {
+            throw InvalidPaginationException::lookaheadOverflow($perPage);
+        }
+
+        // cursorPaginate() always orders by $cursorColumn itself, and
+        // owns the whole ordering: a caller who already called
+        // orderBy()/orderByRaw() on this Query — regardless of which
+        // column, including $cursorColumn itself — has already committed
+        // to an order this method's own WHERE cursorColumn > ? cursor
+        // cannot honor without silently skipping or repeating rows.
+        // Rejected unconditionally rather than inspected for whether the
+        // particular order happens to be harmless: there is no reliable
+        // way to tell "redundant" apart from "conflicting" from a plain
+        // SQL fragment string, and a caller who genuinely wants a
+        // different or composite ordering needs a cursor design this API
+        // does not provide, not a silently-overridden one.
+        if ($this->orders !== []) {
+            throw InvalidPaginationException::preExistingOrderConflictsWithCursor();
+        }
+
+        // Unlike a pre-existing order, a pre-existing offset does have a
+        // provably harmless value: offset(0) compiles to the same "skip
+        // nothing" SQL as no offset() call at all, so it can never
+        // interact with the cursor's own WHERE filter. Anything greater
+        // is reapplied inside every cursor window rather than applied
+        // once before the whole sequence starts, silently skipping rows
+        // the moment a caller advances past the first page — this Query
+        // has no way to know it has already been "used" for a prior page,
+        // so there is nothing here that could make a positive offset safe
+        // on a later call.
+        if ($this->offsetValue !== null && $this->offsetValue !== 0) {
+            throw InvalidPaginationException::preExistingOffsetConflictsWithCursor($this->offsetValue);
+        }
+
+        // cursorPaginate() computes its own limit from perPage — a
+        // pre-existing limit(), including limit(0), represents the
+        // caller wanting some specific window this method's own
+        // perPage + 1 look-ahead would either silently overwrite or
+        // conflict with. Unlike offset(0), limit(0) is not a no-op (it
+        // compiles to "return zero rows"), so there is no analogous safe
+        // value to carve out here.
+        if ($this->limitValue !== null) {
+            throw InvalidPaginationException::preExistingLimitConflictsWithCursor($this->limitValue);
         }
 
         if ($cursorColumnIsQualified && $cursorAlias === null) {

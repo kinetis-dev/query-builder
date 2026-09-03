@@ -51,7 +51,7 @@ final class MySqlDialect implements Dialect
     }
 
     #[\Override]
-    public function extractInsertedId(SqlResult $result, string $primaryKey): ?int
+    public function extractInsertedId(SqlResult $result, string $primaryKey): int|string|null
     {
         return $result->getLastInsertId();
     }

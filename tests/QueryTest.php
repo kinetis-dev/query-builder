@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder\Tests;
 
+use Kinetis\Persistence\Driver\BufferedSqlResult;
 use Kinetis\QueryBuilder\Dialect\MySqlDialect;
 use Kinetis\QueryBuilder\Dialect\PostgresDialect;
 use Kinetis\QueryBuilder\Exception\InvalidPaginationException;
@@ -14,6 +15,7 @@ use Kinetis\QueryBuilder\Tests\Fixtures\QueuedRowsMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\QueuedSqlResult;
 use Kinetis\QueryBuilder\Tests\Fixtures\SpyMysqlLink;
 use InvalidArgumentException;
+use LogicException;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
@@ -210,10 +212,10 @@ final class QueryTest extends TestCase
     {
         $compiled = $this->mysql()->table('users')
             ->where('id', '=', 5)
-            ->toUpdateSql(['name' => 'Alon', 'email' => 'alon@noy.cc']);
+            ->toUpdateSql(['name' => 'Alon', 'email' => 'alon@example.com']);
 
         self::assertSame('UPDATE `users` SET `name` = ?, `email` = ? WHERE `id` = ?', $compiled->sql);
-        self::assertSame(['Alon', 'alon@noy.cc', 5], $compiled->params);
+        self::assertSame(['Alon', 'alon@example.com', 5], $compiled->params);
     }
 
     public function test_delete_binds_only_where_values(): void
@@ -233,18 +235,54 @@ final class QueryTest extends TestCase
 
     public function test_my_sql_dialect_insert_get_id_query_has_no_returning_clause(): void
     {
-        $compiled = (new MySqlDialect())->insertGetIdQuery('users', ['email' => 'alon@noy.cc'], 'id');
+        $compiled = (new MySqlDialect())->insertGetIdQuery('users', ['email' => 'alon@example.com'], 'id');
 
         self::assertSame('INSERT INTO `users` (`email`) VALUES (?)', $compiled->sql);
-        self::assertSame(['alon@noy.cc'], $compiled->params);
+        self::assertSame(['alon@example.com'], $compiled->params);
     }
 
     public function test_postgres_dialect_insert_get_id_query_appends_returning(): void
     {
-        $compiled = (new PostgresDialect())->insertGetIdQuery('users', ['email' => 'alon@noy.cc'], 'id');
+        $compiled = (new PostgresDialect())->insertGetIdQuery('users', ['email' => 'alon@example.com'], 'id');
 
         self::assertSame('INSERT INTO "users" ("email") VALUES (?) RETURNING "id"', $compiled->sql);
-        self::assertSame(['alon@noy.cc'], $compiled->params);
+        self::assertSame(['alon@example.com'], $compiled->params);
+    }
+
+    /**
+     * extractInsertedId() just forwards SqlResult::getLastInsertId() —
+     * a MySQL UNSIGNED BIGINT id past PHP_INT_MAX must pass through
+     * exactly as its own canonical decimal string, never coerced.
+     */
+    public function test_my_sql_dialect_extract_inserted_id_preserves_a_string_beyond_php_int_max(): void
+    {
+        $result = new BufferedSqlResult([], 1, null, '18446744073709551615');
+
+        self::assertSame('18446744073709551615', (new MySqlDialect())->extractInsertedId($result, 'id'));
+    }
+
+    /**
+     * The end-to-end path — Query::insertGetId() through the real
+     * dialect, against a real BufferedSqlResult carrying a MySQL
+     * UNSIGNED BIGINT id past PHP_INT_MAX — must return the exact
+     * preserved string unchanged, not a lossily-cast, silently wrong
+     * int.
+     */
+    public function test_insert_get_id_returns_a_mysql_id_beyond_php_int_max_as_the_exact_string(): void
+    {
+        $link = new QueuedRowsMysqlLink([new BufferedSqlResult([], 1, null, '18446744073709551615')]);
+        $query = new Query($link);
+
+        self::assertSame('18446744073709551615', $query->insertGetId(['email' => 'alon@example.com']));
+    }
+
+    /** The common case still comes back as a real int, unaffected by the string-preservation path. */
+    public function test_insert_get_id_returns_an_ordinary_mysql_id_as_an_int(): void
+    {
+        $link = new QueuedRowsMysqlLink([new BufferedSqlResult([], 1, null, 42)]);
+        $query = new Query($link);
+
+        self::assertSame(42, $query->insertGetId(['email' => 'alon@example.com']));
     }
 
     // --- where()'s operator, orderBy()'s direction, and join()'s type
@@ -439,12 +477,343 @@ final class QueryTest extends TestCase
         $this->mysql()->table('users')->paginate(10, 0);
     }
 
+    /**
+     * The largest page for this perPage whose (page - 1) * perPage
+     * offset still fits a native int — the arithmetic bound check must
+     * let it through, all the way to count()'s own query. FakeMysqlLink
+     * throwing LogicException (not InvalidPaginationException) is the
+     * proof: the request reached the fake database, meaning the bound
+     * check did not reject it.
+     */
+    public function test_paginate_accepts_the_largest_page_whose_offset_still_fits_a_native_int(): void
+    {
+        $perPage = 2;
+        $largestSafePage = intdiv(\PHP_INT_MAX, $perPage) + 1;
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('FakeMysqlLink does not execute queries.');
+
+        $this->mysql()->table('users')->paginate($perPage, $largestSafePage);
+    }
+
+    /**
+     * One page past the largest safe one above: (page - 1) * perPage now
+     * overflows to a float, which offset(int) would otherwise reject
+     * with a raw TypeError — but only after count() already queried the
+     * database. Rejected here instead, before count() ever runs:
+     * FakeMysqlLink never receives a query, proven by
+     * InvalidPaginationException surfacing rather than
+     * FakeMysqlLink's own LogicException.
+     */
+    public function test_paginate_rejects_the_first_page_whose_offset_overflows_a_native_int(): void
+    {
+        $perPage = 2;
+        $firstOverflowingPage = intdiv(\PHP_INT_MAX, $perPage) + 2;
+
+        $this->expectException(InvalidPaginationException::class);
+        $this->expectExceptionMessage(
+            "paginate() cannot serve page {$firstOverflowingPage} at perPage {$perPage}: (page - 1) * perPage "
+            . "exceeds PHP's native integer range. Request an earlier page or a smaller perPage.",
+        );
+
+        $this->mysql()->table('users')->paginate($perPage, $firstOverflowingPage);
+    }
+
     public function test_cursor_paginate_rejects_a_non_positive_per_page(): void
     {
         $this->expectException(InvalidPaginationException::class);
         $this->expectExceptionMessage('cursorPaginate() needs a perPage of at least 1, got 0.');
 
         $this->mysql()->table('users')->cursorPaginate(0, null);
+    }
+
+    /**
+     * cursorPaginate() owns the whole ordering of the query it runs — a
+     * plain, structured orderBy() the caller already set before calling
+     * it is exactly the ambiguous state
+     * InvalidPaginationException::preExistingOrderConflictsWithCursor()
+     * exists to reject, rather than silently compiling a
+     * WHERE cursorColumn > ? that no longer describes the actual result
+     * order. The spy receiving zero calls proves the rejection happens
+     * before the database is ever touched.
+     */
+    public function test_cursor_paginate_rejects_a_pre_existing_structured_order(): void
+    {
+        $spy = new SpyMysqlLink();
+        $query = new Query($spy)->table('orders')->orderBy('name');
+
+        try {
+            $query->cursorPaginate(20, null, cursorColumn: 'id');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException $e) {
+            self::assertSame(
+                'cursorPaginate() orders the query by its own $cursorColumn and cannot combine that with an '
+                . 'orderBy()/orderByRaw() call already made on this Query — even one that only reorders the '
+                . 'same column, since the WHERE cursorColumn > ? comparison this method builds only makes '
+                . 'sense against the column results are actually ordered by. Pagination by a different or '
+                . 'composite ordering needs its own cursor design, which this API does not provide: call '
+                . 'cursorPaginate() on a Query with no orderBy()/orderByRaw() calls of your own.',
+                $e->getMessage(),
+            );
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /** orderByRaw() triggers the identical rejection as a structured orderBy() — both leave the same non-empty order state behind. */
+    public function test_cursor_paginate_rejects_a_pre_existing_raw_order(): void
+    {
+        $spy = new SpyMysqlLink();
+        $query = new Query($spy)->table('orders')->orderByRaw('name DESC');
+
+        try {
+            $query->cursorPaginate(20, null, cursorColumn: 'id');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException) {
+            // The exact message is already pinned above — this test is
+            // about orderByRaw() triggering the same rejection.
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /**
+     * Ordering by the exact column cursorPaginate() would order by
+     * anyway is still rejected — redundant, but still ambiguous state:
+     * the check is unconditional rather than an attempt to distinguish
+     * "redundant" from "genuinely conflicting" from a plain SQL fragment
+     * string, which this class has no reliable way to do.
+     */
+    public function test_cursor_paginate_rejects_a_pre_existing_order_on_the_cursor_column_itself(): void
+    {
+        $spy = new SpyMysqlLink();
+        $query = new Query($spy)->table('orders')->orderBy('id');
+
+        try {
+            $query->cursorPaginate(20, null, cursorColumn: 'id');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException) {
+            // expected
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /**
+     * An alias created by selectRaw() and ordered by, before
+     * cursorPaginate() is called, is exactly as ambiguous as any other
+     * pre-existing order and rejected the same way — the alias itself
+     * is never what makes a combination like this legal or not.
+     */
+    public function test_cursor_paginate_rejects_a_pre_existing_order_referencing_a_select_raw_alias(): void
+    {
+        $spy = new SpyMysqlLink();
+        $query = new Query($spy)->table('orders')->select('id', 'name')->selectRaw('id * 2 AS rank_value')
+            ->orderBy('rank_value');
+
+        try {
+            $query->cursorPaginate(1, null, cursorColumn: 'orders.id', cursorAlias: 'order_cursor');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException) {
+            // expected
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /**
+     * A real cursor value, so where() would already have mutated
+     * $wheres under the old ordering — comparing the same Query's
+     * compiled SQL before the call against after the caught exception
+     * proves nothing survived it.
+     */
+    public function test_cursor_paginate_rejects_a_pre_existing_order_before_mutating_the_query(): void
+    {
+        $query = $this->mysql()->table('orders')->orderBy('name');
+        $beforeSql = $query->toSelectSql()->sql;
+
+        try {
+            $query->cursorPaginate(20, '100', cursorColumn: 'id');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException) {
+            // The exception itself is asserted by the tests above — this
+            // one is purely about what state survives it.
+        }
+
+        self::assertSame($beforeSql, $query->toSelectSql()->sql);
+    }
+
+    /**
+     * The reason this rejection exists: with ids 1..5, offset(1),
+     * perPage=1, a first cursorPaginate() call would deliver id 2 and
+     * report cursor "2" — then a second call rebuilding the same query
+     * (offset(1) again, the real shape of a fresh Query per HTTP
+     * request) would compile WHERE id > 2 combined with OFFSET 1,
+     * silently skipping id 3 and delivering id 4 instead — confirmed
+     * against a real MySQL database. Rejected at the very first call
+     * instead, so that sequence never begins.
+     */
+    public function test_cursor_paginate_rejects_a_pre_existing_positive_offset(): void
+    {
+        $spy = new SpyMysqlLink();
+        $query = new Query($spy)->table('users')->offset(1);
+
+        try {
+            $query->cursorPaginate(1, null, cursorColumn: 'id');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException $e) {
+            self::assertSame(
+                'cursorPaginate() cannot combine with a pre-existing offset(1): the offset is reapplied '
+                . 'inside every cursor window rather than applied once before the sequence starts, which '
+                . 'silently skips rows as soon as you advance past the first page. Cursor pagination has no '
+                . 'offset concept of its own — its cursor value is the only position it tracks. If you need '
+                . 'to skip an initial run of rows, obtain a starting cursor for that position instead, or use '
+                . 'offset-based paginate() if page-jumping is what you actually need.',
+                $e->getMessage(),
+            );
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /**
+     * offset(0) is the one pre-existing offset value with no skip risk —
+     * it compiles to the same "skip nothing" SQL as no offset() call at
+     * all, so it is accepted rather than rejected.
+     */
+    public function test_cursor_paginate_accepts_a_pre_existing_zero_offset(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('users')->offset(0)->cursorPaginate(20, null, cursorColumn: 'id');
+
+        self::assertCount(1, $spy->calls);
+    }
+
+    /**
+     * A real cursor value, so where() would already have mutated
+     * $wheres under the old behavior — comparing the same Query's
+     * compiled SQL before the call against after the caught exception
+     * proves nothing survived it.
+     */
+    public function test_cursor_paginate_rejects_a_pre_existing_offset_before_mutating_the_query(): void
+    {
+        $query = $this->mysql()->table('orders')->offset(1);
+        $beforeSql = $query->toSelectSql()->sql;
+
+        try {
+            $query->cursorPaginate(20, '100', cursorColumn: 'id');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException) {
+            // expected
+        }
+
+        self::assertSame($beforeSql, $query->toSelectSql()->sql);
+    }
+
+    /**
+     * cursorPaginate() computes its own limit from perPage — a
+     * pre-existing limit() would either be silently overwritten or
+     * fought over with that look-ahead, so it is rejected outright.
+     */
+    public function test_cursor_paginate_rejects_a_pre_existing_limit(): void
+    {
+        $spy = new SpyMysqlLink();
+        $query = new Query($spy)->table('users')->limit(3);
+
+        try {
+            $query->cursorPaginate(20, null, cursorColumn: 'id');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException $e) {
+            self::assertSame(
+                'cursorPaginate() cannot combine with a pre-existing limit(3): it computes its own limit '
+                . 'from perPage, fetching one extra row to detect whether another page exists. Pass perPage '
+                . 'instead of calling limit() yourself.',
+                $e->getMessage(),
+            );
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /**
+     * Unlike offset(0), limit(0) is not a no-op — it compiles to "return
+     * zero rows" — so there is no analogous safe value here: every
+     * pre-existing limit() is rejected, including zero.
+     */
+    public function test_cursor_paginate_rejects_a_pre_existing_zero_limit(): void
+    {
+        $spy = new SpyMysqlLink();
+        $query = new Query($spy)->table('users')->limit(0);
+
+        try {
+            $query->cursorPaginate(20, null, cursorColumn: 'id');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException) {
+            // expected
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /**
+     * The largest perPage whose perPage + 1 look-ahead still fits a
+     * native int — the arithmetic bound check must let it through, all
+     * the way to the real fetch. FakeMysqlLink throwing LogicException
+     * (not InvalidPaginationException) is the proof the request reached
+     * the fake database.
+     */
+    public function test_cursor_paginate_accepts_the_largest_per_page_whose_lookahead_still_fits_a_native_int(): void
+    {
+        $largestSafePerPage = \PHP_INT_MAX - 1;
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('FakeMysqlLink does not execute queries.');
+
+        $this->mysql()->table('users')->cursorPaginate($largestSafePerPage, null, cursorColumn: 'id');
+    }
+
+    /**
+     * One perPage past the largest safe one above: perPage + 1 now
+     * overflows to a float, which limit(int) would otherwise reject with
+     * a raw TypeError — but only after where()/selectColumns have
+     * already been mutated. Rejected here instead, before either runs.
+     */
+    public function test_cursor_paginate_rejects_the_first_per_page_whose_lookahead_overflows_a_native_int(): void
+    {
+        $firstOverflowingPerPage = \PHP_INT_MAX;
+
+        $this->expectException(InvalidPaginationException::class);
+        $this->expectExceptionMessage(
+            "cursorPaginate() cannot use a perPage of {$firstOverflowingPerPage}: it looks ahead by perPage + 1 "
+            . "to detect another page, and that would exceed PHP's native integer range. Request a smaller "
+            . 'perPage.',
+        );
+
+        $this->mysql()->table('users')->cursorPaginate($firstOverflowingPerPage, null, cursorColumn: 'id');
+    }
+
+    /**
+     * An overflowing perPage combined with a real cursor: under the
+     * unfixed ordering, where() would already have appended a WHERE
+     * clause before the perPage + 1 arithmetic ever ran. Comparing the
+     * compiled SQL before and after the caught exception proves the
+     * query is untouched — the bound check runs before cursorPaginate()
+     * makes its first mutation, not after.
+     */
+    public function test_cursor_paginate_rejects_an_overflowing_per_page_before_mutating_the_query(): void
+    {
+        $query = $this->mysql()->table('users');
+        $beforeSql = $query->toSelectSql()->sql;
+
+        try {
+            $query->cursorPaginate(\PHP_INT_MAX, '100', cursorColumn: 'id');
+            self::fail('cursorPaginate() was expected to throw.');
+        } catch (InvalidPaginationException) {
+            // The exception itself is asserted by the two tests above —
+            // this one is purely about what state survives it.
+        }
+
+        self::assertSame($beforeSql, $query->toSelectSql()->sql);
     }
 
     /**
@@ -572,46 +941,6 @@ final class QueryTest extends TestCase
         self::assertTrue($page->hasMore);
         self::assertSame('7', $page->nextCursor);
         self::assertSame([['name' => 'a']], $page->data, 'The alias must be stripped from the returned rows.');
-    }
-
-    /**
-     * A caller's own offset() is part of the query cursorPaginate()
-     * paginates, and reading the cursor from the delivered row is what
-     * keeps the two consistent: the cursor names the row that was
-     * actually returned, whatever offset shifted the window to.
-     */
-    public function test_cursor_paginate_honours_a_caller_supplied_offset(): void
-    {
-        $link = new QueuedRowsMysqlLink([
-            new QueuedSqlResult([
-                ['id' => 2, 'order_cursor' => 2],
-                ['id' => 3, 'order_cursor' => 3],
-            ]),
-        ]);
-
-        $page = new Query($link)->table('orders')->offset(1)
-            ->cursorPaginate(1, null, cursorColumn: 'orders.id', cursorAlias: 'order_cursor');
-
-        self::assertStringContainsString('OFFSET 1', $link->calls[0]->sql);
-        self::assertSame([['id' => 2]], $page->data);
-        self::assertSame('2', $page->nextCursor, 'The cursor must name the row actually delivered.');
-    }
-
-    /**
-     * An alias created by selectRaw() and ordered by is a legal query
-     * this must not break: the projection that defines the alias has to
-     * still be there when the ORDER BY referring to it runs.
-     */
-    public function test_cursor_paginate_keeps_a_projection_alias_its_own_order_by_depends_on(): void
-    {
-        $spy = new SpyMysqlLink();
-        new Query($spy)->table('orders')->select('id', 'name')->selectRaw('id * 2 AS rank_value')
-            ->orderBy('rank_value')
-            ->cursorPaginate(1, null, cursorColumn: 'orders.id', cursorAlias: 'order_cursor');
-
-        self::assertCount(1, $spy->calls);
-        self::assertStringContainsString('id * 2 AS rank_value', $spy->calls[0]->sql);
-        self::assertStringContainsString('`rank_value`', $spy->calls[0]->sql);
     }
 
     /**
