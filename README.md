@@ -22,9 +22,9 @@ Part of [Kinetis](https://kinetis.dev/), a non-blocking PHP framework for
 API-first applications, developed in the
 [kinetis-dev/kinetis](https://github.com/kinetis-dev/kinetis) monorepo.
 
-MySQL and Postgres via `amphp/mysql`/`amphp/postgres`, with row-to-DTO
-mapping via `Kinetis\Validation\Hydrator` — the same mechanism that
-hydrates a `#[Body]` request DTO. Not an ORM: no relationships, no
+MySQL and Postgres through `kinetis/persistence`'s drivers, with
+row-to-DTO mapping via `Kinetis\Validation\Hydrator` — the same mechanism
+that hydrates a `#[Body]` request DTO. Not an ORM: no relationships, no
 migrations, no change-tracking, no `save()`-on-a-model.
 
 ```php
@@ -39,10 +39,10 @@ $orders = new Query($db)
     ->get(OrderRow::class);
 ```
 
-`Query` works with either backend through the same shared `Amp\Sql\SqlLink`
-family both drivers implement, auto-detected from the concrete connection
-you pass in — and composes directly inside
-`Kinetis\Persistence\TransactionGuard::transaction()`.
+`Query` works with either backend through the shared
+`Kinetis\Persistence\Contract\SqlLink` family both drivers implement,
+auto-detected from the concrete connection you pass in — and composes
+directly inside `Kinetis\Persistence\TransactionGuard::transaction()`.
 
 ## Installation
 

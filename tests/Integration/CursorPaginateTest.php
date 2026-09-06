@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder\Tests\Integration;
 
+use Kinetis\Http\Pagination\CursorPaginator;
 use Kinetis\Persistence\Contract\MysqlLink;
 use Kinetis\Persistence\Contract\PostgresLink;
 use Kinetis\Persistence\Driver\MysqliAsyncClient;
@@ -17,14 +18,11 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Real-backend regression coverage for cursorPaginate(): the cursor must
- * name the row that was actually delivered, and the caller's own
- * projection must come back exactly as they asked for it — including a
- * column that happens to share a name with anything internal. Also
- * covers, against a real link rather than a fake, the query state
- * cursorPaginate() refuses to combine with: a pre-existing
- * orderBy()/orderByRaw() call, and a pre-existing offset() greater than
- * zero — offset(0) is the one value proven accepted instead.
+ * Real-backend coverage for cursorPaginate(): the cursor must name the
+ * row that was actually delivered, the caller's own projection must come
+ * back exactly as asked for, a cursor after an OR filter must not repeat
+ * a delivered row, and the query state this method refuses to combine
+ * with must be rejected before any query reaches the database.
  *
  * Environment-gated (skips unless MYSQL_HOST/POSTGRES_HOST is set), so a
  * plain local `vendor/bin/phpunit` run stays database-free. CI's
@@ -177,12 +175,10 @@ final class CursorPaginateTest extends TestCase
     }
 
     /**
-     * cursorPaginate() refuses to combine its own cursor order with a
-     * caller-supplied orderBy() — including one a projection alias
-     * depends on. Proven against a real link, not just a fake: the
-     * rejection happens before any query reaches the database, and both
-     * the Query and the link are left fully usable afterward — get() on
-     * the same, untouched Query still runs its own orderBy() correctly.
+     * A caller-supplied orderBy() is rejected, including one a
+     * projection alias depends on, before any query reaches the
+     * database — and the Query and link are left fully usable, proven by
+     * get() on the same untouched Query still running that order.
      */
     #[DataProvider('backends')]
     public function test_a_pre_existing_order_by_on_a_projection_alias_is_rejected_before_any_query_runs(string $backend): void
@@ -213,14 +209,10 @@ final class CursorPaginateTest extends TestCase
 
     /**
      * A pre-existing offset() greater than zero is rejected before any
-     * query reaches the database — the reason: with offset(1) and
-     * perPage=1, a first cursorPaginate() call delivers row 2 and
-     * reports cursor "2", then a second call rebuilding the same query
-     * (offset(1) again, the real shape of a fresh Query per HTTP
-     * request) compiles WHERE id > 2 combined with OFFSET 1, silently
-     * skipping row 3. Proven against a real link, not just a fake: the
-     * rejection happens before any query runs, and both the Query and
-     * the link are left fully usable afterward.
+     * query reaches the database: with offset(1) and perPage=1, the
+     * first call would deliver row 2 and report cursor "2", and a second
+     * call rebuilding the same query would combine WHERE id > 2 with
+     * OFFSET 1 and skip row 3. The link stays usable afterward.
      */
     #[DataProvider('backends')]
     public function test_a_pre_existing_positive_offset_is_rejected_before_any_query_runs(string $backend): void
@@ -245,11 +237,7 @@ final class CursorPaginateTest extends TestCase
         $link->close();
     }
 
-    /**
-     * offset(0) is the one pre-existing offset value with no skip risk
-     * — it compiles to the same "skip nothing" SQL as no offset() call
-     * at all — so it is accepted and cursorPaginate() runs normally.
-     */
+    /** offset(0) skips nothing, so it is accepted and pagination runs normally. */
     #[DataProvider('backends')]
     public function test_a_pre_existing_zero_offset_is_accepted(string $backend): void
     {
@@ -268,10 +256,7 @@ final class CursorPaginateTest extends TestCase
     /**
      * The consistency guarantee, made deterministic: a row deleted the
      * instant the page's own query returns cannot move the cursor,
-     * because there is no second read to see the changed table. Under
-     * the previous two-query design this exact sequence delivered id=1
-     * and reported "2", permanently skipping id=2 — a row that was never
-     * delivered.
+     * because there is no second read to see the changed table.
      */
     #[DataProvider('backends')]
     public function test_a_write_landing_between_reads_cannot_move_the_cursor_off_the_delivered_row(string $backend): void
@@ -295,6 +280,54 @@ final class CursorPaginateTest extends TestCase
         );
 
         $link->close();
+    }
+
+    /**
+     * The cursor filter is compiled as `(existing predicate) AND
+     * cursorColumn > ?`. Appended flat to a predicate containing an OR,
+     * SQL precedence would bind it to the last arm alone, and n1 —
+     * matching the first arm — would come back on every page.
+     */
+    #[DataProvider('backends')]
+    public function test_a_cursor_after_an_or_filter_does_not_repeat_a_delivered_row(string $backend): void
+    {
+        $link = self::makeLink($backend);
+        self::seed($link, $backend, 'kin_cursor_or_filter', rows: 4);
+
+        $first = self::orFilteredPage($link, null);
+
+        self::assertSame(['n1', 'n2'], self::names($first->data));
+        self::assertSame('2', $first->nextCursor);
+
+        $second = self::orFilteredPage($link, $first->nextCursor);
+
+        self::assertSame(['n3', 'n4'], self::names($second->data));
+
+        $link->close();
+    }
+
+    private static function orFilteredPage(MysqlLink|PostgresLink $link, ?string $cursor): CursorPaginator
+    {
+        return new Query($link)->table('kin_cursor_or_filter')
+            ->where('name', '=', 'n1')
+            ->orWhere('name', '!=', 'n1')
+            ->cursorPaginate(2, $cursor, 'id');
+    }
+
+    /**
+     * @param list<mixed> $rows
+     * @return list<string>
+     */
+    private static function names(array $rows): array
+    {
+        $names = [];
+
+        foreach ($rows as $row) {
+            self::assertIsArray($row);
+            $names[] = (string) $row['name'];
+        }
+
+        return $names;
     }
 
     /**
@@ -324,20 +357,13 @@ final class CursorPaginateTest extends TestCase
     }
 
     /**
-     * The documented precondition, pinned against both engines rather
-     * than left to prose: an alias colliding with a column only a
-     * wildcard brings in *replaces* that column. The appended cursor
-     * takes the key, so the value read back is the cursor's — correct —
-     * and the caller's own field is gone with the cleanup.
-     *
-     * There is deliberately no exception here. It cannot be detected
-     * without column metadata the result does not carry, and the one
-     * check that would fire (distinct keys against the server's column
-     * count) also fires on the ordinary duplicate `id` of any `SELECT *`
-     * across a join, which is the most common reason to want a cursor
-     * alias at all. An alias the caller *listed* is rejected up front
-     * instead; see QueryTest. This test exists so the untestable half
-     * stays honestly described rather than silently drifting.
+     * The documented precondition, pinned against both engines: an alias
+     * colliding with a column only a wildcard brings in replaces that
+     * column. The appended cursor takes the key, so the value read back
+     * is the cursor's — correct — and the caller's own field goes with
+     * the cleanup. There is no exception here because detecting it needs
+     * column metadata the result does not carry; an alias the caller
+     * listed is rejected up front instead, in QueryTest.
      */
     #[DataProvider('backends')]
     public function test_an_alias_colliding_with_a_wildcard_column_replaces_it(string $backend): void
