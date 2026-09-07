@@ -7,7 +7,7 @@ namespace Kinetis\QueryBuilder;
 use Kinetis\Persistence\Contract\SqlResult;
 
 /**
- * The only two things MySQL and Postgres genuinely differ on for what this
+ * The only two things MySQL and Postgres differ on for what this
  * package does — everything else (parameterized "?" placeholders, LIMIT n
  * OFFSET m, getRowCount()) is identical between them at the
  * Kinetis\Persistence\Contract\SqlLink level:

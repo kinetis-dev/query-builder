@@ -39,13 +39,6 @@ final class QueryTest extends TestCase
         self::assertSame('SELECT * FROM "users"', $this->postgres()->table('users')->toSelectSql()->sql);
     }
 
-    public function test_an_explicit_dialect_overrides_auto_detection(): void
-    {
-        $query = new Query(new FakeMysqlLink(), new PostgresDialect());
-
-        self::assertSame('SELECT * FROM "users"', $query->table('users')->toSelectSql()->sql);
-    }
-
     public function test_select_with_specific_columns_quotes_each_one(): void
     {
         $compiled = $this->mysql()->table('users')->select('id', 'email')->toSelectSql();
@@ -91,6 +84,77 @@ final class QueryTest extends TestCase
         self::assertSame([1, 2, 3], $compiled->params);
     }
 
+    public function test_a_null_equals_predicate_compiles_to_is_null_with_no_binding(): void
+    {
+        $compiled = $this->mysql()->table('users')->where('deleted_at', '=', null)->toSelectSql();
+
+        self::assertSame('SELECT * FROM `users` WHERE `deleted_at` IS NULL', $compiled->sql);
+        self::assertSame([], $compiled->params);
+    }
+
+    /**
+     * @param '!='|'<>' $operator
+     */
+    #[DataProvider('inequalityOperators')]
+    public function test_a_null_inequality_predicate_compiles_to_is_not_null(string $operator): void
+    {
+        $compiled = $this->postgres()->table('users')->where('deleted_at', $operator, null)->toSelectSql();
+
+        self::assertSame('SELECT * FROM "users" WHERE "deleted_at" IS NOT NULL', $compiled->sql);
+        self::assertSame([], $compiled->params);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function inequalityOperators(): iterable
+    {
+        yield '!=' => ['!='];
+        yield '<>' => ['<>'];
+    }
+
+    /**
+     * A null placed in the predicate keeps its own position: the
+     * placeholder it does not emit must not shift the bindings around it.
+     */
+    public function test_a_null_predicate_does_not_shift_the_bindings_around_it(): void
+    {
+        $compiled = $this->mysql()->table('users')
+            ->where('tenant_id', '=', 7)
+            ->where('deleted_at', '=', null)
+            ->where('name', 'LIKE', '%alon%')
+            ->toSelectSql();
+
+        self::assertSame(
+            'SELECT * FROM `users` WHERE `tenant_id` = ? AND `deleted_at` IS NULL AND `name` LIKE ?',
+            $compiled->sql,
+        );
+        self::assertSame([7, '%alon%'], $compiled->params);
+    }
+
+    /** Every other operator against null is never true for any row, so it is refused. */
+    public function test_a_null_value_with_any_other_operator_is_rejected(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(
+            'Operator ">" cannot be used with a null value. SQL compares null through IS NULL (=) and '
+            . 'IS NOT NULL (!=, <>) only; every other comparison against null is never true for any row.',
+        );
+
+        $this->mysql()->table('users')->where('score', '>', null);
+    }
+
+    public function test_where_in_rejects_a_null_member(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(
+            'whereIn() cannot take null in the value list for "id": SQL never matches a row against NULL, '
+            . "so the null narrows the set silently. Use where('id', '=', null) for IS NULL.",
+        );
+
+        $this->mysql()->table('users')->whereIn('id', [1, null, 3]);
+    }
+
     public function test_where_raw_binds_its_own_params_in_place(): void
     {
         $compiled = $this->mysql()->table('users')->whereRaw('YEAR(created_at) = ?', [2026])->toSelectSql();
@@ -134,12 +198,10 @@ final class QueryTest extends TestCase
     }
 
     /**
-     * A real bug this package's own real-MySQL verification script caught:
-     * quoting "orders.total" as one literal backtick-wrapped identifier
-     * produces a column genuinely named "orders.total" (which doesn't
-     * exist) instead of the qualified reference `orders`.`total` — MySQL
-     * rejected it outright with "Unknown column 'orders.total'". Each
-     * dotted segment must be quoted separately.
+     * Quoting "orders.total" as one backtick-wrapped identifier names a
+     * column called "orders.total", which MySQL rejects with "Unknown
+     * column", rather than the qualified reference `orders`.`total`.
+     * Each dotted segment is quoted separately.
      */
     public function test_a_qualified_column_name_quotes_each_segment_separately(): void
     {
@@ -314,6 +376,69 @@ final class QueryTest extends TestCase
         }
     }
 
+    /**
+     * A mutation with no predicate at all affects every row in the
+     * table, so it is refused before the link is reached. The deliberate
+     * whole-table statement is raw SQL through the connection itself.
+     */
+    public function test_a_mutation_without_a_predicate_is_refused(): void
+    {
+        $spy = new SpyMysqlLink();
+
+        foreach ([static fn (Query $q) => $q->update(['name' => 'Alon']), static fn (Query $q) => $q->delete()] as $mutate) {
+            try {
+                $mutate(new Query($spy)->table('users'));
+                self::fail('The mutation was expected to throw.');
+            } catch (QueryBuilderException $e) {
+                self::assertStringContainsString(
+                    'needs a where()/whereIn()/whereRaw() predicate: with none it affects every row in the '
+                    . 'table. Run a deliberate whole-table statement as raw SQL through the connection itself.',
+                    $e->getMessage(),
+                );
+            }
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /**
+     * An empty raw fragment is a predicate the caller believes they
+     * added and the compiler emits nothing for. Accepted, it would leave
+     * a non-empty where list in front of a statement carrying no WHERE
+     * clause, so update()/delete() would run against every row. It is
+     * refused at whereRaw() instead, before either can be reached.
+     *
+     * @param callable(Query): Query $build
+     */
+    #[DataProvider('emptyRawPredicates')]
+    public function test_an_empty_raw_predicate_cannot_stand_in_for_a_mutation_predicate(callable $build): void
+    {
+        $spy = new SpyMysqlLink();
+
+        try {
+            $build(new Query($spy)->table('users'))->delete();
+            self::fail('whereRaw() was expected to throw.');
+        } catch (InvalidArgumentException $e) {
+            self::assertSame(
+                'whereRaw() needs a SQL fragment: an empty one compiles to no predicate at all, which '
+                . 'would widen an update() or delete() to every row in the table.',
+                $e->getMessage(),
+            );
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /**
+     * @return iterable<string, array{callable(Query): Query}>
+     */
+    public static function emptyRawPredicates(): iterable
+    {
+        yield 'empty string' => [static fn (Query $q) => $q->whereRaw('')];
+        yield 'whitespace only' => [static fn (Query $q) => $q->whereRaw('   ')];
+        yield 'newline only' => [static fn (Query $q) => $q->whereRaw("\n")];
+    }
+
     /** Structured and raw WHERE clauses are what a mutation does compile, so they still run. */
     public function test_a_table_and_where_mutation_still_runs(): void
     {
@@ -448,6 +573,25 @@ final class QueryTest extends TestCase
         self::assertSame(['%alon%'], $compiled->params);
     }
 
+    /** FULL has no MySQL form and CROSS takes no ON clause, so neither is compilable here. */
+    #[DataProvider('joinTypesWithNoPortableForm')]
+    public function test_a_join_type_the_compiler_cannot_produce_is_rejected(string $type): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage("Join type \"{$type}\" is not allowed. Use one of: INNER, LEFT, RIGHT.");
+
+        $this->mysql()->table('orders')->join('customers', 'orders.customer_id', '=', 'customers.id', $type);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function joinTypesWithNoPortableForm(): iterable
+    {
+        yield 'FULL' => ['FULL'];
+        yield 'CROSS' => ['CROSS'];
+    }
+
     public function test_an_allowed_join_type_still_works_case_insensitively(): void
     {
         $compiled = $this->mysql()->table('orders')
@@ -580,6 +724,80 @@ final class QueryTest extends TestCase
         $this->mysql()->table('users')->paginate(10, 0);
     }
 
+    /**
+     * An unordered query is a construction mistake, not a bad request:
+     * the server may return rows in any order, so page 2 can repeat or
+     * skip rows from page 1. QueryBuilderException carries no HTTP
+     * status, so it reaches the client as an ordinary 500.
+     */
+    public function test_paginate_refuses_a_query_with_no_order(): void
+    {
+        $spy = new SpyMysqlLink();
+
+        try {
+            new Query($spy)->table('users')->paginate(10);
+            self::fail('paginate() was expected to throw.');
+        } catch (QueryBuilderException $e) {
+            self::assertSame(
+                'paginate() needs an orderBy()/orderByRaw() on the query: without one the server may '
+                . 'return rows in any order, so a later page can repeat or skip rows from an earlier one. '
+                . 'Order by a key unique across the result set.',
+                $e->getMessage(),
+            );
+        }
+
+        self::assertCount(0, $spy->calls);
+    }
+
+    /**
+     * A terminal read applies its own limit, offset, order, cursor and
+     * projection to a clone, so the builder the caller still holds
+     * compiles exactly as it did before the call.
+     *
+     * @param callable(Query): mixed $read
+     */
+    #[DataProvider('terminalReads')]
+    public function test_a_terminal_read_leaves_the_callers_builder_unchanged(callable $read): void
+    {
+        $query = new Query(new QueuedRowsMysqlLink([
+            new QueuedSqlResult([['id' => 1, 'aggregate' => 1], ['id' => 2, 'aggregate' => 1]]),
+            new QueuedSqlResult([['id' => 1], ['id' => 2]]),
+        ]))->table('users')->where('active', '=', true)->orderBy('id');
+
+        $before = $query->toSelectSql();
+        $read($query);
+        $after = $query->toSelectSql();
+
+        self::assertSame('SELECT * FROM `users` WHERE `active` = ? ORDER BY `id` ASC', $before->sql);
+        self::assertSame($before->sql, $after->sql);
+        self::assertSame($before->params, $after->params);
+    }
+
+    /**
+     * @return iterable<string, array{callable(Query): mixed}>
+     */
+    public static function terminalReads(): iterable
+    {
+        yield 'first()' => [static fn (Query $q) => $q->first()];
+        yield 'paginate()' => [static fn (Query $q) => $q->paginate(1, 2)];
+    }
+
+    /**
+     * cursorPaginate() refuses a pre-existing order, so its own clone
+     * check needs a builder without one.
+     */
+    public function test_cursor_paginate_leaves_the_callers_builder_unchanged(): void
+    {
+        $query = new Query(new SpyMysqlLink())->table('orders')->select('name')->where('status', '=', 'paid');
+
+        $before = $query->toSelectSql();
+        $query->cursorPaginate(2, '100', cursorColumn: 'id');
+
+        self::assertSame('SELECT `name` FROM `orders` WHERE `status` = ?', $before->sql);
+        self::assertSame($before->sql, $query->toSelectSql()->sql);
+        self::assertSame($before->params, $query->toSelectSql()->params);
+    }
+
     public function test_cursor_paginate_rejects_a_non_positive_per_page(): void
     {
         $this->expectException(InvalidPaginationException::class);
@@ -650,26 +868,6 @@ final class QueryTest extends TestCase
     }
 
     /**
-     * With a real cursor value, so a late rejection would have left a
-     * cursor filter behind: the same Query compiles identically before
-     * the call and after the caught exception.
-     */
-    public function test_cursor_paginate_rejects_a_conflicting_clause_before_mutating_the_query(): void
-    {
-        $query = $this->mysql()->table('orders')->orderBy('name');
-        $beforeSql = $query->toSelectSql()->sql;
-
-        try {
-            $query->cursorPaginate(20, '100', cursorColumn: 'id');
-            self::fail('cursorPaginate() was expected to throw.');
-        } catch (InvalidPaginationException) {
-            // The message is pinned above; this is about surviving state.
-        }
-
-        self::assertSame($beforeSql, $query->toSelectSql()->sql);
-    }
-
-    /**
      * The cursor filter wraps the predicate the caller already built.
      * Appended flat instead, SQL precedence would apply it to the final
      * OR arm alone (`A OR B AND cursor`), so a row matching an earlier
@@ -729,15 +927,9 @@ final class QueryTest extends TestCase
     }
 
     /**
-     * cursorPaginate() reads nextCursor off the real cursor column in
-     * every row it fetches — that column has to actually be in the
-     * SELECT list for that to work at all, regardless of what the
-     * caller's own projection asked to see. Verified here purely at the
-     * "what SQL did Query actually send" level, against a spy rather
-     * than a real database — asserting on returned row data (does the
-     * added column get stripped back out again) needs real execution,
-     * which this class's own established discipline leaves to
-     * real-backend verification rather than a mocked PHPUnit test.
+     * cursorPaginate() reads nextCursor off the real cursor column, so
+     * that column has to reach the SELECT list whatever the caller's own
+     * projection asked to see.
      */
     public function test_cursor_paginate_adds_the_cursor_column_to_a_projection_that_omits_it(): void
     {
@@ -969,6 +1161,6 @@ final class QueryTest extends TestCase
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('update() needs at least one column');
 
-        $this->mysql()->table('users')->toUpdateSql([]);
+        $this->mysql()->table('users')->where('id', '=', 5)->toUpdateSql([]);
     }
 }

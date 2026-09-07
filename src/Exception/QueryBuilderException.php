@@ -26,6 +26,29 @@ final class QueryBuilderException extends RuntimeException
         );
     }
 
+    public static function mutationNeedsAPredicate(string $method): self
+    {
+        return new self(
+            "{$method} needs a where()/whereIn()/whereRaw() predicate: with none it affects every row in "
+            . 'the table. Run a deliberate whole-table statement as raw SQL through the connection itself.',
+        );
+    }
+
+    /**
+     * Without an order the server may return rows in any order it likes,
+     * so two pages of the same query can repeat or skip rows. Which
+     * column makes a page stable is the caller's own choice, so
+     * paginate() requires one rather than inventing it.
+     */
+    public static function paginationNeedsAnOrder(): self
+    {
+        return new self(
+            'paginate() needs an orderBy()/orderByRaw() on the query: without one the server may return '
+            . 'rows in any order, so a later page can repeat or skip rows from an earlier one. Order by a '
+            . 'key unique across the result set.',
+        );
+    }
+
     public static function cursorColumnMissingFromRow(string $cursorRowKey): self
     {
         return new self(

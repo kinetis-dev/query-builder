@@ -11,11 +11,10 @@ use Kinetis\Persistence\Contract\SqlResult;
 final class MySqlDialect implements Dialect
 {
     /**
-     * Splits on "." and quotes each segment separately — a qualified
+     * Splits on "." and quotes each segment separately: a qualified
      * "orders.total" must become `orders`.`total`, not a single literal
-     * column named `orders.total` (which MySQL rejects outright: caught
-     * against a real MySQL container, not assumed, when this package's
-     * own join() verification failed with "Unknown column 'orders.total'").
+     * column named `orders.total`, which MySQL rejects with "Unknown
+     * column".
      */
     #[\Override]
     public function quoteIdentifier(string $identifier): string
@@ -68,11 +67,10 @@ final class MySqlDialect implements Dialect
         }
 
         // null, float, string, ... — always bound as a real parameter.
-        // Floats are excluded deliberately (PHP's (string) cast can
-        // produce "NAN"/"INF", neither a valid SQL literal); strings are
-        // excluded because a safe string literal depends on connection
-        // charset/SQL-mode state this class deliberately knows nothing
-        // about — the drivers' own execute() binding handles them.
+        // A float's (string) cast can produce "NAN"/"INF", neither a
+        // valid SQL literal, and a safe string literal depends on
+        // connection charset/SQL-mode state this class does not know.
+        // The drivers' own execute() binding handles both.
         return null;
     }
 }

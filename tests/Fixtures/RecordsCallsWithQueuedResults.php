@@ -11,10 +11,9 @@ use LogicException;
 /**
  * RecordsCalls' own "always EmptySqlResult" replaced with a caller-
  * supplied queue, one result per query()/execute() call in the order
- * they're made — the fast-unit-level way to drive cursorPaginate()'s
- * hasMore=true / fetchBoundaryCursor() branches (which a real backend's
- * own EmptySqlResult-returning spy never reaches, since hasMore can
- * never become true against zero rows) without a live database.
+ * they're made — the way to drive the branches a zero-row result never
+ * reaches, such as cursorPaginate()'s hasMore=true, without a live
+ * database.
  */
 trait RecordsCallsWithQueuedResults
 {

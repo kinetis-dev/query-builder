@@ -3,12 +3,11 @@
 declare(strict_types=1);
 
 /**
- * Real-backend regression coverage for Kinetis\QueryBuilder\Query — the
- * same MySQL/Postgres round trip originally verified by hand, now run on
- * every CI push instead of once. Query's own compilation logic is unit
- * tested against a fake link that throws on execute() (see QueryTest.php);
- * this exercises the methods that actually execute() something, which no
- * fake can meaningfully stand in for.
+ * Real-backend regression coverage for Kinetis\QueryBuilder\Query against
+ * MySQL and Postgres. Query's own compilation is unit tested against a
+ * fake link that throws on execute() (see QueryTest.php); this exercises
+ * the methods that actually execute() something, which no fake can
+ * meaningfully stand in for.
  */
 
 require __DIR__ . '/../vendor/autoload.php';
@@ -32,20 +31,29 @@ function run(string $backend, $link): void
 
     $link->execute('DROP TABLE IF EXISTS items');
     $idColumn = $backend === 'MySQL' ? 'INT AUTO_INCREMENT' : 'SERIAL';
-    $link->execute("CREATE TABLE items (id {$idColumn} PRIMARY KEY, name VARCHAR(50) NOT NULL, category VARCHAR(20) NOT NULL)");
+    $link->execute(
+        "CREATE TABLE items (id {$idColumn} PRIMARY KEY, name VARCHAR(50) NOT NULL, "
+        . 'category VARCHAR(20) NOT NULL, note VARCHAR(50) NULL)',
+    );
 
     foreach (range(1, 25) as $i) {
-        new Query($link)->table('items')->insert(['name' => "item{$i}", 'category' => $i % 2 === 0 ? 'even' : 'odd']);
+        new Query($link)->table('items')->insert([
+            'name' => "item{$i}",
+            'category' => $i % 2 === 0 ? 'even' : 'odd',
+            // A bound null: only predicates take SQL's IS NULL form.
+            'note' => $i % 5 === 0 ? "note{$i}" : null,
+        ]);
     }
 
     check("{$backend}: count() sees all 25 rows", new Query($link)->table('items')->count() === 25);
     check("{$backend}: where() filters correctly", new Query($link)->table('items')->where('category', '=', 'even')->count() === 12);
     check("{$backend}: whereIn() filters correctly", count(new Query($link)->table('items')->whereIn('name', ['item1', 'item2', 'item3'])->get()) === 3);
-    // §6.7 of the independent evaluation report: whereIn([]) used to emit
-    // syntactically invalid SQL (`IN ()`) — must now compile to a real,
-    // valid, zero-row query against a live database, not just pass a unit
-    // test against a fake link.
     check("{$backend}: whereIn() with an empty array returns zero rows, not a SQL error", count(new Query($link)->table('items')->whereIn('name', [])->get()) === 0);
+
+    // A null predicate compiles to IS NULL / IS NOT NULL — the one form
+    // that matches anything at all, which `= NULL` never does.
+    check("{$backend}: where(=, null) matches the rows whose column is null", new Query($link)->table('items')->where('note', '=', null)->count() === 20);
+    check("{$backend}: where(!=, null) matches the rows whose column is set", new Query($link)->table('items')->where('note', '!=', null)->count() === 5);
 
     $id = new Query($link)->table('items')->insertGetId(['name' => 'item26', 'category' => 'even']);
     check("{$backend}: insertGetId() returns a real id", $id !== null);
@@ -63,6 +71,7 @@ function run(string $backend, $link): void
     // Offset pagination — back to 25 rows now that the extra insert was deleted.
     $page = new Query($link)->table('items')->orderBy('id')->paginate(perPage: 10, page: 2);
     check("{$backend}: paginate() page 2 has 10 rows", count($page->data) === 10);
+    check("{$backend}: paginate() page 2 starts where the ordered page 1 ended", $page->data[0]['name'] === 'item11');
     check("{$backend}: paginate() total is 25", $page->total === 25);
     check("{$backend}: paginate() lastPage is 3", $page->lastPage === 3);
 

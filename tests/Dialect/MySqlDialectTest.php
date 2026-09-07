@@ -23,9 +23,9 @@ final class MySqlDialectTest extends TestCase
 
     public function test_null_float_and_string_are_never_inlined(): void
     {
-        // Strings deliberately included: a safe string literal depends on
-        // connection charset/SQL-mode state the dialect knows nothing
-        // about — they always bind through the driver instead.
+        // Strings included: a safe string literal depends on connection
+        // charset/SQL-mode state the dialect does not know, so they
+        // always bind through the driver instead.
         $dialect = new MySqlDialect();
 
         self::assertNull($dialect->literalFor(null));

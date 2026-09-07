@@ -10,11 +10,10 @@ use Traversable;
 
 /**
  * A fixed, caller-supplied set of rows — the fast-unit-level counterpart
- * to a real backend actually returning data, used to exercise
- * cursorPaginate()'s hasMore/fetchBoundaryCursor() branches without a
- * live database (see QueuedRowsMysqlLink/QueuedRowsPostgresLink).
- * Iteration via foreach and fetchRow() intentionally don't share a
- * cursor, matching the real SqlResult contract exactly.
+ * to a real backend returning data, used to reach the branches a spy's
+ * own empty result never does (see QueuedRowsMysqlLink). Iteration via
+ * foreach and fetchRow() do not share a cursor, matching the real
+ * SqlResult contract.
  *
  * @implements IteratorAggregate<int, array<string, mixed>>
  */

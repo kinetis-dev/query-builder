@@ -34,9 +34,8 @@ final class InlineLiteralsTest extends TestCase
     public function test_a_string_where_always_falls_back_to_execute(): void
     {
         // Strings are never inlined: a safe string literal depends on
-        // connection charset/SQL-mode state the dialect deliberately
-        // knows nothing about, and the drivers' own binding is safe by
-        // construction.
+        // connection charset/SQL-mode state the dialect does not know,
+        // and the drivers' own binding is safe by construction.
         $spy = new SpyMysqlLink();
         new Query($spy)->table('items')->where('name', '=', "O'Brien")->get();
 
@@ -45,12 +44,39 @@ final class InlineLiteralsTest extends TestCase
         self::assertSame(["O'Brien"], $spy->calls[0]->params);
     }
 
-    public function test_a_null_value_anywhere_in_the_query_falls_back_to_execute(): void
+    /**
+     * A null predicate compiles to IS NULL and binds nothing, but a null
+     * *value* is still an ordinary bound parameter, and one uninlinable
+     * value sends the whole statement down the execute() path.
+     */
+    public function test_an_inserted_null_value_binds(): void
     {
         $spy = new SpyMysqlLink();
-        new Query($spy)->table('items')->where('id', '=', 1)->where('deleted_at', '=', null)->get();
+        new Query($spy)->table('items')->insert(['id' => 1, 'deleted_at' => null]);
 
         self::assertSame('execute', $spy->calls[0]->method);
+        self::assertSame('INSERT INTO `items` (`id`, `deleted_at`) VALUES (?, ?)', $spy->calls[0]->sql);
+        self::assertSame([1, null], $spy->calls[0]->params);
+    }
+
+    public function test_an_updated_null_value_binds_while_a_null_predicate_does_not(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('items')->where('deleted_at', '=', null)->update(['note' => null]);
+
+        self::assertSame('execute', $spy->calls[0]->method);
+        self::assertSame('UPDATE `items` SET `note` = ? WHERE `deleted_at` IS NULL', $spy->calls[0]->sql);
+        self::assertSame([null], $spy->calls[0]->params);
+    }
+
+    /** A predicate that binds nothing at all still takes the zero-params query() path. */
+    public function test_a_null_predicate_alone_takes_query(): void
+    {
+        $spy = new SpyMysqlLink();
+        new Query($spy)->table('items')->where('deleted_at', '=', null)->get();
+
+        self::assertSame('query', $spy->calls[0]->method);
+        self::assertSame('SELECT * FROM `items` WHERE `deleted_at` IS NULL', $spy->calls[0]->sql);
     }
 
     public function test_a_float_value_falls_back_to_execute(): void

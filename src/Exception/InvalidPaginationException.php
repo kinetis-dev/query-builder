@@ -8,13 +8,12 @@ use Kinetis\Http\Exception\HttpStatusExceptionInterface;
 use InvalidArgumentException;
 
 /**
- * paginate()/cursorPaginate() arguments genuinely invalid for pagination
- * to mean anything (a non-positive page/perPage, an ambiguous cursor
- * alias) rather than a mistake a controller ever built by hand — these
- * routinely trace straight back to an unvalidated HTTP query parameter,
- * so this maps to a 400 the same way MalformedRequestBodyException does,
- * instead of the generic 500 an uncaught InvalidArgumentException would
- * otherwise reach ExceptionHandlerMiddleware as.
+ * paginate()/cursorPaginate() arguments that leave pagination without a
+ * meaning — a non-positive page/perPage, an ambiguous cursor alias.
+ * These trace back to an unvalidated HTTP query parameter, so this maps
+ * to a 400 the same way MalformedRequestBodyException does, rather than
+ * the generic 500 an uncaught InvalidArgumentException would reach
+ * ExceptionHandlerMiddleware as.
  */
 final class InvalidPaginationException extends InvalidArgumentException implements HttpStatusExceptionInterface
 {
