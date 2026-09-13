@@ -6,12 +6,12 @@ namespace Kinetis\QueryBuilder\Tests;
 
 use Kinetis\Persistence\Driver\BufferedSqlResult;
 use Kinetis\QueryBuilder\Dialect\MySqlDialect;
-use Kinetis\QueryBuilder\Dialect\PostgresDialect;
 use Kinetis\QueryBuilder\Exception\InvalidPaginationException;
 use Kinetis\QueryBuilder\Exception\QueryBuilderException;
 use Kinetis\QueryBuilder\Query;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakeMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakePostgresLink;
+use Kinetis\QueryBuilder\Tests\Fixtures\PreparingSpyMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\QueuedRowsMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\QueuedSqlResult;
 use Kinetis\QueryBuilder\Tests\Fixtures\SpyMysqlLink;
@@ -260,16 +260,19 @@ final class QueryTest extends TestCase
         self::assertSame([], $compiled->params);
     }
 
-    public function test_count_only_ignores_order_limit_and_offset(): void
+    public function test_count_ignores_order_limit_and_offset(): void
     {
-        $compiled = $this->mysql()->table('users')
+        $spy = new PreparingSpyMysqlLink();
+
+        new Query($spy)->table('users')
             ->where('active', '=', true)
             ->orderBy('name')
             ->limit(10)
-            ->toSelectSql(countOnly: true);
+            ->offset(20)
+            ->count();
 
-        self::assertSame('SELECT COUNT(*) as aggregate FROM `users` WHERE `active` = ?', $compiled->sql);
-        self::assertSame([true], $compiled->params);
+        self::assertSame('SELECT COUNT(*) AS aggregate FROM `users` WHERE `active` = ?', $spy->calls[0]->sql);
+        self::assertSame([true], $spy->calls[0]->params);
     }
 
     public function test_update_binds_set_values_before_where_bindings(): void
@@ -339,27 +342,35 @@ final class QueryTest extends TestCase
      */
     public static function clausesAMutationCannotCompile(): iterable
     {
-        yield 'select()' => [static fn (Query $q) => $q->select('id'), 'select()/selectRaw()'];
-        yield 'selectRaw()' => [static fn (Query $q) => $q->selectRaw('COUNT(*) AS total'), 'select()/selectRaw()'];
-        yield 'join()' => [
-            static fn (Query $q) => $q->join('orders', 'users.id', '=', 'orders.user_id'),
-            'join()/leftJoin()',
-        ];
-        yield 'leftJoin()' => [
-            static fn (Query $q) => $q->leftJoin('orders', 'users.id', '=', 'orders.user_id'),
-            'join()/leftJoin()',
-        ];
+        $other = static fn (): Query => new Query(new SpyMysqlLink())->table('orders')->select('user_id');
+        $joins = 'join()/leftJoin()/joinOn()/joinSub()/crossJoin()';
+        $projection = 'select()/selectRaw()/selectSub()';
+
+        yield 'with()' => [static fn (Query $q) => $q->with('recent', $other()), 'with()/withRecursive()'];
+        yield 'a table alias' => [static fn (Query $q) => $q->table('users', as: 'u'), 'a table() alias'];
+        yield 'fromSub()' => [static fn (Query $q) => $q->fromSub($other(), 'o'), 'fromSub()'];
+        yield 'distinct()' => [static fn (Query $q) => $q->distinct(), 'distinct()'];
+        yield 'select()' => [static fn (Query $q) => $q->select('id'), $projection];
+        yield 'selectRaw()' => [static fn (Query $q) => $q->selectRaw('COUNT(*) AS total'), $projection];
+        yield 'selectSub()' => [static fn (Query $q) => $q->selectSub($other()->limit(1), 'last_order'), $projection];
+        yield 'join()' => [static fn (Query $q) => $q->join('orders', 'users.id', '=', 'orders.user_id'), $joins];
+        yield 'leftJoin()' => [static fn (Query $q) => $q->leftJoin('orders', 'users.id', '=', 'orders.user_id'), $joins];
+        yield 'crossJoin()' => [static fn (Query $q) => $q->crossJoin('orders'), $joins];
+        yield 'groupBy()' => [static fn (Query $q) => $q->groupBy('team_id'), 'groupBy()/groupByRaw()'];
+        yield 'having()' => [static fn (Query $q) => $q->having('team_id', '=', 1), 'having()/orHaving()/havingRaw()'];
+        yield 'union()' => [static fn (Query $q) => $q->union($other()), 'union()/intersect()/except()'];
         yield 'orderBy()' => [static fn (Query $q) => $q->orderBy('name'), 'orderBy()/orderByRaw()'];
         yield 'orderByRaw()' => [static fn (Query $q) => $q->orderByRaw('name DESC'), 'orderBy()/orderByRaw()'];
         yield 'limit()' => [static fn (Query $q) => $q->limit(1), 'limit()'];
         yield 'offset()' => [static fn (Query $q) => $q->offset(1), 'offset()'];
+        yield 'lockForShare()' => [static fn (Query $q) => $q->lockForShare(), 'lockForUpdate()/lockForShare()'];
     }
 
     private static function unsupportedMutationMessage(string $method, string $clause): string
     {
         return "{$method} compiles the table and the WHERE clause only, so {$clause} would be dropped from the "
             . 'statement and it would affect every row the WHERE clause matches. Build the mutation on a Query '
-            . 'carrying only table() and where()/whereIn()/whereRaw() calls.';
+            . 'carrying only table() and where predicates.';
     }
 
     /** Every unsupported clause on the query is named, not just the first one found. */
@@ -391,8 +402,9 @@ final class QueryTest extends TestCase
                 self::fail('The mutation was expected to throw.');
             } catch (QueryBuilderException $e) {
                 self::assertStringContainsString(
-                    'needs a where()/whereIn()/whereRaw() predicate: with none it affects every row in the '
-                    . 'table. Run a deliberate whole-table statement as raw SQL through the connection itself.',
+                    'needs a where predicate: with none it affects every row in the table, and an empty '
+                    . 'whereGroup() adds none. Run a deliberate whole-table statement as raw SQL through the '
+                    . 'connection itself.',
                     $e->getMessage(),
                 );
             }
@@ -459,22 +471,6 @@ final class QueryTest extends TestCase
         $compiled = $this->postgres()->table('users')->where('id', '=', 1)->toSelectSql();
 
         self::assertSame('SELECT * FROM "users" WHERE "id" = ?', $compiled->sql);
-    }
-
-    public function test_my_sql_dialect_insert_get_id_query_has_no_returning_clause(): void
-    {
-        $compiled = (new MySqlDialect())->insertGetIdQuery('users', ['email' => 'alon@example.com'], 'id');
-
-        self::assertSame('INSERT INTO `users` (`email`) VALUES (?)', $compiled->sql);
-        self::assertSame(['alon@example.com'], $compiled->params);
-    }
-
-    public function test_postgres_dialect_insert_get_id_query_appends_returning(): void
-    {
-        $compiled = (new PostgresDialect())->insertGetIdQuery('users', ['email' => 'alon@example.com'], 'id');
-
-        self::assertSame('INSERT INTO "users" ("email") VALUES (?) RETURNING "id"', $compiled->sql);
-        self::assertSame(['alon@example.com'], $compiled->params);
     }
 
     /**
@@ -573,7 +569,7 @@ final class QueryTest extends TestCase
         self::assertSame(['%alon%'], $compiled->params);
     }
 
-    /** FULL has no MySQL form and CROSS takes no ON clause, so neither is compilable here. */
+    /** FULL has no MySQL-family form, and CROSS has its own crossJoin(), so join() accepts neither type. */
     #[DataProvider('joinTypesWithNoPortableForm')]
     public function test_a_join_type_the_compiler_cannot_produce_is_rejected(string $type): void
     {

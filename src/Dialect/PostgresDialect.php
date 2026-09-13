@@ -4,18 +4,11 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder\Dialect;
 
-use Kinetis\QueryBuilder\CompiledQuery;
 use Kinetis\QueryBuilder\Dialect;
 use Kinetis\Persistence\Contract\SqlResult;
 
 final class PostgresDialect implements Dialect
 {
-    /**
-     * Splits on "." and quotes each segment separately — see
-     * MySqlDialect::quoteIdentifier() for why this matters: a qualified
-     * "orders.total" must become "orders"."total", not one literal column
-     * named "orders.total".
-     */
     #[\Override]
     public function quoteIdentifier(string $identifier): string
     {
@@ -35,19 +28,50 @@ final class PostgresDialect implements Dialect
     }
 
     #[\Override]
-    public function insertGetIdQuery(string $table, array $data, string $primaryKey): CompiledQuery
+    public function limitOffset(?int $limit, ?int $offset): string
     {
-        $columns = array_keys($data);
+        $sql = $limit === null ? '' : " LIMIT {$limit}";
 
-        $sql = sprintf(
-            'INSERT INTO %s (%s) VALUES (%s) RETURNING %s',
-            $this->quoteIdentifier($table),
-            implode(', ', array_map($this->quoteIdentifier(...), $columns)),
-            implode(', ', array_fill(0, count($columns), '?')),
-            $this->quoteIdentifier($primaryKey),
-        );
+        return $offset === null ? $sql : "{$sql} OFFSET {$offset}";
+    }
 
-        return new CompiledQuery($sql, array_values($data));
+    #[\Override]
+    public function sharedLock(): string
+    {
+        return ' FOR SHARE';
+    }
+
+    #[\Override]
+    public function admitsLimitedInSubquery(): bool
+    {
+        return true;
+    }
+
+    /** No conflict target: a conflict on any unique constraint skips the row. */
+    #[\Override]
+    public function insertOrIgnoreClause(array $columns): string
+    {
+        return ' ON CONFLICT DO NOTHING';
+    }
+
+    #[\Override]
+    public function upsertClause(array $uniqueBy, array $update): string
+    {
+        return ' ON CONFLICT (' . implode(', ', array_map($this->quoteIdentifier(...), $uniqueBy)) . ') DO UPDATE SET '
+            . implode(', ', array_map(
+                function (string $column): string {
+                    $quoted = $this->quoteIdentifier($column);
+
+                    return "{$quoted} = EXCLUDED.{$quoted}";
+                },
+                $update,
+            ));
+    }
+
+    #[\Override]
+    public function insertGetIdClause(string $primaryKey): string
+    {
+        return ' RETURNING ' . $this->quoteIdentifier($primaryKey);
     }
 
     #[\Override]

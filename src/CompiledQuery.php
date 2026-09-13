@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Kinetis\QueryBuilder;
 
 /**
- * The output of every Query compile step (toSelectSql()/toInsertSql()/...):
+ * The output of every Query compile step (toSelectSql()/toUpdateSql()/toDeleteSql()):
  * the exact SQL string to run, and the bound parameter list in the exact
  * order its "?" placeholders appear in that string. Building both together,
  * in one pass, in every compile method is what guarantees the two always

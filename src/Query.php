@@ -4,106 +4,118 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder;
 
+use Closure;
+use InvalidArgumentException;
 use Kinetis\Http\Pagination\CursorPaginator;
 use Kinetis\Http\Pagination\Paginator;
-use Kinetis\QueryBuilder\Dialect\MySqlDialect;
-use Kinetis\QueryBuilder\Dialect\PostgresDialect;
-use Kinetis\Validation\Hydrator;
 use Kinetis\Persistence\Contract\MysqlLink;
 use Kinetis\Persistence\Contract\PostgresLink;
 use Kinetis\Persistence\Contract\PrefersPreparedStatements;
 use Kinetis\Persistence\Contract\SqlResult;
+use Kinetis\Persistence\Contract\SqlTransaction;
+use Kinetis\QueryBuilder\Dialect\MySqlDialect;
+use Kinetis\QueryBuilder\Dialect\PostgresDialect;
 use Kinetis\QueryBuilder\Exception\InvalidPaginationException;
 use Kinetis\QueryBuilder\Exception\QueryBuilderException;
-use InvalidArgumentException;
+use Kinetis\Validation\Hydrator;
 
 /**
- * A thin, parameterized SQL query builder — not an ORM. No relationships,
+ * A thin, parameterized SQL query builder over the SQL MySQL 8.4,
+ * MariaDB 11.4 and PostgreSQL 16 share — not an ORM. No relationships,
  * no migrations, no change-tracking, no save()-on-a-model. One class
- * serves both backends through the shared
- * Kinetis\Persistence\Contract\SqlLink family, exactly as
- * Kinetis\Persistence\TransactionGuard does: MySQL and Postgres differ
- * only on identifier quoting and on how a generated primary key comes
- * back after an INSERT, both isolated in Dialect.
+ * serves every target through the Kinetis\Persistence\Contract\SqlLink
+ * family; the spellings that differ are isolated in Dialect.
  *
  * $link accepts a plain driver client *or* an in-flight SqlTransaction —
  * both implement SqlLink — so a Query composes directly inside
  * TransactionGuard::transaction()'s callback with no transaction concept
- * of its own.
+ * of its own. A row lock is the one feature that requires the latter.
  *
- * Every compile*() method below builds its SQL string and bound-parameter
- * list together, in a single pass. That is what keeps each "?" and its
- * own value in the same position once structured where() calls mix with
- * whereRaw() fragments — by construction, not by bookkeeping.
+ * Every compile path builds its SQL string and bound-parameter list
+ * together, in a single pass, so each "?" keeps its own value in the same
+ * position however structured and raw fragments mix. The bindings follow
+ * the emitted SQL: CTEs, SELECT expressions, FROM subquery, joins and
+ * their ON predicates, WHERE, the cursor predicate, GROUP BY, HAVING, set
+ * operands, ORDER BY.
  *
  * One instance is one query: table()/select()/where()/... accumulate on
  * $this and nothing resets between calls, so reusing one instance across
  * logically separate queries merges them into a single query. Always
- * `new Query($link)` for each distinct query. first(), paginate() and
- * cursorPaginate() are the exception — each applies the limit, offset,
- * order, cursor filter and projection it needs to a shallow clone, so
- * the caller's own builder is unchanged when they return.
+ * `new Query($link)` for each distinct query. The terminals that add a
+ * limit, projection, order or cursor filter apply it to a clone, and
+ * __clone() copies the predicate state, so the caller's builder is
+ * unchanged when they return. A Query passed as a subquery, CTE or set
+ * operand is compiled when it is attached: changing it afterwards does
+ * not change this one.
  */
 final class Query
 {
     /**
-     * where()'s $operator, orderBy()'s $direction, join()'s $type, and
-     * where()/whereIn()/whereRaw()'s $boolean are interpolated into SQL
-     * verbatim, unlike every other user-reachable slot in this class. A
-     * sortable/filterable API (`?sort=name&dir=asc&op=gte`) is exactly
-     * the shape that passes a request value into one of them, so each is
-     * allow-listed at the call that sets it. Every other value or
-     * identifier here is already safe by construction — bound as "?" or
-     * identifier-quoted.
+     * orderBy()'s $direction and join()'s $type are interpolated into SQL
+     * verbatim, as are the operators and booleans Conditions allow-lists.
+     * A sortable API (`?sort=name&dir=asc`) is exactly the shape that
+     * passes a request value into one of them, so each is allow-listed
+     * where it is set.
      */
-    private const array ALLOWED_WHERE_OPERATORS = ['=', '!=', '<>', '<', '<=', '>', '>=', 'LIKE', 'NOT LIKE'];
-
     private const array ALLOWED_ORDER_DIRECTIONS = ['ASC', 'DESC'];
 
     /**
-     * INNER, LEFT and RIGHT compile to the same portable syntax on both
-     * backends. FULL and CROSS do not — MySQL has no FULL JOIN at all,
-     * and CROSS takes no ON clause, which is the only join shape join()
-     * builds.
+     * INNER, LEFT and RIGHT compile to the same syntax on every target.
+     * FULL has no MySQL-family form; CROSS takes no ON clause and has its
+     * own crossJoin().
      */
     private const array ALLOWED_JOIN_TYPES = ['INNER', 'LEFT', 'RIGHT'];
 
-    private const array ALLOWED_WHERE_BOOLEANS = ['AND', 'OR'];
+    /**
+     * MySQL, MariaDB and PostgreSQL all cap one prepared statement at
+     * 65,535 bound parameters. A larger batch is refused rather than split,
+     * which would turn one statement's outcome into several.
+     */
+    private const int MAX_PLACEHOLDERS = 65535;
 
     private readonly Dialect $dialect;
 
+    /** @var Closure(Query, string): Snapshot */
+    private readonly Closure $capture;
+
     private string $table = '';
+
+    private ?string $tableAlias = null;
+
+    /** @var array{sql: string, params: list<mixed>}|null */
+    private ?array $fromSub = null;
+
+    /** @var list<array{sql: string, params: list<mixed>, recursive: bool}> */
+    private array $ctes = [];
+
+    private bool $distinct = false;
 
     /** @var list<string> */
     private array $selectColumns = ['*'];
 
-    /** @var list<string> */
-    private array $selectRawExpressions = [];
+    /**
+     * selectRaw() and selectSub() expressions, rendered, in call order.
+     *
+     * @var list<array{sql: string, params: list<mixed>}>
+     */
+    private array $selectExpressions = [];
 
     /**
      * An already-quoted `expr AS alias` fragment appended to the compiled
      * SELECT list, set only on cursorPaginate()'s own clone. Separate
-     * from $selectRawExpressions above because that one is subject to
+     * from $selectExpressions above because those are subject to
      * compileSelectColumns()'s "drop the default wildcard once something
      * explicit was asked for" rule, which is right for a caller's own
-     * selectRaw() and wrong here: appending a cursor alias must never
+     * expression and wrong here: appending a cursor alias must never
      * silently take `*` away from a projection the caller never touched.
      */
     private ?string $cursorAliasExpression = null;
 
-    /**
-     * @var list<
-     *     array{type: 'basic', column: string, operator: string, value: mixed, boolean: 'AND'|'OR'}
-     *     |array{type: 'null', column: string, operator: 'IS NULL'|'IS NOT NULL', boolean: 'AND'|'OR'}
-     *     |array{type: 'raw', sql: string, params: list<mixed>, boolean: 'AND'|'OR'}
-     *     |array{type: 'in', column: string, values: list<mixed>, boolean: 'AND'|'OR'}
-     * >
-     */
-    private array $wheres = [];
+    private Conditions $wheres;
 
     /**
      * cursorPaginate()'s own filter, kept apart from $wheres so
-     * compileWheres() can emit it as `(existing predicate) AND column > ?`
+     * compileWhere() can emit it as `(existing predicate) AND column > ?`
      * — appended to the flat list instead, an OR in the caller's own
      * predicate would bind tighter than the cursor and leave it applying
      * to the last OR arm alone.
@@ -112,20 +124,32 @@ final class Query
      */
     private ?array $cursorPredicate = null;
 
-    /** @var list<array{type: string, table: string, first: string, operator: string, second: string}> */
+    /** @var list<array{type: 'INNER'|'LEFT'|'RIGHT'|'CROSS', derived: bool, sql: string, params: list<mixed>}> */
     private array $joins = [];
 
-    /** @var list<string> */
+    /** @var list<array{sql: string, params: list<mixed>}> */
+    private array $groups = [];
+
+    private Conditions $havings;
+
+    /** @var list<array{sql: string, params: list<mixed>, isLimited: bool}> */
+    private array $setOperations = [];
+
+    /** @var list<array{sql: string, params: list<mixed>}> */
     private array $orders = [];
 
     private ?int $limitValue = null;
 
     private ?int $offsetValue = null;
 
+    /** The lock suffix lockForUpdate()/lockForShare() set, with its leading space. */
+    private ?string $lock = null;
+
     /**
-     * Set by whereRaw()/selectRaw()/orderByRaw() — see run()'s own
-     * docblock for why this disables literal-inlining for the whole query
-     * once any raw SQL text is involved.
+     * Set by selectRaw()/groupByRaw()/orderByRaw() and by attaching raw
+     * SQL through a join, subquery, CTE or set operand; the predicate
+     * clauses track their own. See run() for why this disables
+     * literal-inlining for the whole query.
      */
     private bool $hasRawFragment = false;
 
@@ -137,7 +161,23 @@ final class Query
      */
     public function __construct(private readonly MysqlLink|PostgresLink $link)
     {
-        $this->dialect = $link instanceof MysqlLink ? new MySqlDialect() : new PostgresDialect();
+        $dialect = $link instanceof MysqlLink ? new MySqlDialect() : new PostgresDialect();
+        $this->dialect = $dialect;
+        // Static, so it keeps no reference to this instance; declared in
+        // this class, so it may compile another Query's private state.
+        $this->capture = static fn (Query $query, string $method): Snapshot => $query->snapshot($dialect, $method);
+        $this->wheres = new Conditions($dialect, $this->capture);
+        $this->havings = new Conditions($dialect, $this->capture);
+    }
+
+    /**
+     * The predicate objects are the only mutable state a Query holds by
+     * reference; every other property is a value or an immutable snapshot.
+     */
+    public function __clone()
+    {
+        $this->wheres = clone $this->wheres;
+        $this->havings = clone $this->havings;
     }
 
     /**
@@ -147,31 +187,28 @@ final class Query
      * safe to write into the SQL text may — see inlineLiterals(), which
      * decides on the driver rather than on this class.
      *
+     * Every "?" this class emits itself has exactly one binding pushed at
+     * the same time, which is what makes a positional substitution safe.
+     * Raw SQL text breaks that: it may contain a "?" that was never a
+     * placeholder, so $hasRawFragment sends the whole statement to
+     * execute() rather than telling a real placeholder from a decoy one.
+     *
      * @param list<mixed> $params
      */
-    private function run(string $sql, array $params): SqlResult
+    private function run(string $sql, array $params, bool $hasRawFragment): SqlResult
     {
         if ($params === []) {
             return $this->link->query($sql);
         }
 
-        $inlined = $this->inlineLiterals($sql, $params);
+        $inlined = $hasRawFragment ? null : $this->inlineLiterals($sql, $params);
 
         return $inlined !== null ? $this->link->query($inlined) : $this->link->execute($sql, $params);
     }
 
     /**
-     * Every "?" this class emits itself has exactly one binding pushed at
-     * the same time, in the same left-to-right order, which is what makes
-     * a positional "replace each ? with its value" substitution safe.
-     * Raw SQL text breaks that: whereRaw()/selectRaw()/orderByRaw() carry
-     * caller-supplied text this class cannot parse, which may contain a
-     * "?" that was never a placeholder, so $hasRawFragment sends the whole
-     * query to execute() rather than telling a real placeholder from a
-     * decoy one.
-     *
-     * Returns null — bind instead — for a raw fragment, or for any value
-     * Dialect::literalFor() will not write as a literal.
+     * Returns null — bind instead — for any value Dialect::literalFor()
+     * will not write as a literal.
      *
      * @param list<mixed> $params
      */
@@ -180,10 +217,6 @@ final class Query
         // Whether writing a value into the SQL beats binding it is the
         // driver's own answer, and this marker is where it states it.
         if ($this->link instanceof PrefersPreparedStatements) {
-            return null;
-        }
-
-        if ($this->hasRawFragment) {
             return null;
         }
 
@@ -214,11 +247,56 @@ final class Query
         return $result;
     }
 
-    public function table(string $table): static
+    private function containsRawSql(): bool
+    {
+        return $this->hasRawFragment || $this->wheres->hasRawFragment() || $this->havings->hasRawFragment();
+    }
+
+    /**
+     * $as is quoted as an identifier. update(), increment(), decrement(),
+     * delete() and the insert terminals refuse an aliased table.
+     */
+    public function table(string $table, ?string $as = null): static
     {
         $this->table = $table;
+        $this->tableAlias = $as;
+        $this->fromSub = null;
 
         return $this;
+    }
+
+    /** Selects from a derived table: `FROM (subquery) AS $as`. Replaces table(). */
+    public function fromSub(Query $query, string $as): static
+    {
+        $snapshot = $this->attach($query, 'fromSub()');
+        $this->fromSub = ['sql' => "({$snapshot->sql}) AS " . $this->dialect->quoteIdentifier($as), 'params' => $snapshot->params];
+        $this->table = '';
+        $this->tableAlias = null;
+
+        return $this;
+    }
+
+    /**
+     * A common table expression this query can select from by $name.
+     * $columns names its result columns; [] leaves them to its projection.
+     *
+     * @param list<string> $columns
+     */
+    public function with(string $name, Query $query, array $columns = []): static
+    {
+        return $this->addCte('with()', $name, $query, $columns, false);
+    }
+
+    /**
+     * A CTE that may refer to itself by $name, typically a union() of a
+     * seed query and a query joining $name. One recursive CTE makes the
+     * whole WITH clause `WITH RECURSIVE`.
+     *
+     * @param list<string> $columns
+     */
+    public function withRecursive(string $name, Query $query, array $columns = []): static
+    {
+        return $this->addCte('withRecursive()', $name, $query, $columns, true);
     }
 
     public function select(string ...$columns): static
@@ -229,138 +307,322 @@ final class Query
     }
 
     /**
-     * A raw SELECT expression (an aggregate, a function call) alongside
-     * whatever select()/the default "*" already contributes. No bound
-     * params here — unlike whereRaw(), a SELECT expression is virtually
-     * never built from user-controlled values, so this stays minimal;
-     * whereRaw() is where parameter binding actually matters.
+     * A raw SELECT expression (an aggregate, a function call). It is
+     * appended to the columns an explicit select() named, and replaces an
+     * untouched default "*". Its "?" placeholders bind $params where the
+     * expression appears in the SQL.
+     *
+     * @param list<mixed> $params
      */
-    public function selectRaw(string $sql): static
+    public function selectRaw(string $sql, array $params = []): static
     {
-        $this->selectRawExpressions[] = $sql;
+        $this->selectExpressions[] = ['sql' => $sql, 'params' => $params];
         $this->hasRawFragment = true;
 
         return $this;
     }
 
+    /** A scalar subquery selected as $as, which may correlate with this query's tables. */
+    public function selectSub(Query $query, string $as): static
+    {
+        $snapshot = $this->attach($query, 'selectSub()');
+        $this->selectExpressions[] = [
+            'sql' => "({$snapshot->sql}) AS " . $this->dialect->quoteIdentifier($as),
+            'params' => $snapshot->params,
+        ];
+
+        return $this;
+    }
+
+    public function distinct(): static
+    {
+        $this->distinct = true;
+
+        return $this;
+    }
+
     /**
-     * A null $value follows SQL's own null semantics instead of binding:
-     * `=` compiles to IS NULL, `!=` and `<>` to IS NOT NULL, neither
-     * with a placeholder. Every other operator against null is rejected
-     * — `column > NULL` is never true for any row, so it can only be a
-     * mistake.
-     *
      * @param 'AND'|'OR' $boolean
+     * @see Conditions::where() for null handling
      */
     public function where(string $column, string $operator, mixed $value, string $boolean = 'AND'): static
     {
-        $normalizedOperator = self::assertAllowedOperator($operator);
-        $normalizedBoolean = self::assertAllowedBoolean($boolean);
-
-        if ($value === null) {
-            $this->wheres[] = ['type' => 'null', 'column' => $column, 'operator' => self::nullOperatorFor($normalizedOperator), 'boolean' => $normalizedBoolean];
-
-            return $this;
-        }
-
-        $this->wheres[] = ['type' => 'basic', 'column' => $column, 'operator' => $normalizedOperator, 'value' => $value, 'boolean' => $normalizedBoolean];
+        $this->wheres->where($column, $operator, $value, $boolean);
 
         return $this;
     }
 
     public function orWhere(string $column, string $operator, mixed $value): static
     {
-        return $this->where($column, $operator, $value, 'OR');
+        $this->wheres->orWhere($column, $operator, $value);
+
+        return $this;
     }
 
-    /**
-     * An empty $values compiles to a constant-false predicate (`1 = 0`)
-     * rather than the syntactically invalid `IN ()` MySQL/Postgres both
-     * reject outright — filtering by an empty result set (e.g. "posts by
-     * these users" when the user list came back empty) is a common real
-     * case, not an edge case to leave broken.
-     *
-     * A null member is rejected instead: SQL never matches a row against
-     * NULL, so one that slipped into the list changes what the query
-     * means without changing how it reads. Use where($column, '=', null)
-     * for IS NULL.
-     *
-     * @param list<mixed> $values
-     * @param 'AND'|'OR' $boolean
-     */
-    public function whereIn(string $column, array $values, string $boolean = 'AND'): static
+    public function whereColumn(string $first, string $operator, string $second): static
     {
-        $normalizedBoolean = self::assertAllowedBoolean($boolean);
+        $this->wheres->whereColumn($first, $operator, $second);
 
-        if (in_array(null, $values, true)) {
-            throw new InvalidArgumentException(
-                "whereIn() cannot take null in the value list for \"{$column}\": SQL never matches a row "
-                . "against NULL, so the null narrows the set silently. Use where('{$column}', '=', null) "
-                . 'for IS NULL.',
-            );
-        }
+        return $this;
+    }
 
-        $this->wheres[] = ['type' => 'in', 'column' => $column, 'values' => $values, 'boolean' => $normalizedBoolean];
+    public function orWhereColumn(string $first, string $operator, string $second): static
+    {
+        $this->wheres->orWhereColumn($first, $operator, $second);
 
         return $this;
     }
 
     /**
-     * A raw WHERE fragment for anything the structured form can't express
-     * (a function call, a subquery) — $sql's own "?" placeholders are
-     * still bound as real parameters via $params, in the position they
-     * appear here; "raw" means raw SQL syntax, never raw unparameterized
-     * user input.
-     *
-     * $sql must carry an actual fragment. An empty or whitespace-only one
-     * is a predicate the caller believes they added and the compiler
-     * emits nothing for, which would let update()/delete() past their
-     * own predicate requirement and affect every row.
-     *
+     * @param list<mixed>|Query $values
+     * @param 'AND'|'OR' $boolean
+     * @see Conditions::whereIn()
+     */
+    public function whereIn(string $column, array|Query $values, string $boolean = 'AND'): static
+    {
+        $this->wheres->whereIn($column, $values, $boolean);
+
+        return $this;
+    }
+
+    /**
+     * @param list<mixed>|Query $values
+     * @param 'AND'|'OR' $boolean
+     * @see Conditions::whereNotIn()
+     */
+    public function whereNotIn(string $column, array|Query $values, string $boolean = 'AND'): static
+    {
+        $this->wheres->whereNotIn($column, $values, $boolean);
+
+        return $this;
+    }
+
+    public function whereBetween(string $column, mixed $low, mixed $high): static
+    {
+        $this->wheres->whereBetween($column, $low, $high);
+
+        return $this;
+    }
+
+    public function orWhereBetween(string $column, mixed $low, mixed $high): static
+    {
+        $this->wheres->orWhereBetween($column, $low, $high);
+
+        return $this;
+    }
+
+    public function whereNotBetween(string $column, mixed $low, mixed $high): static
+    {
+        $this->wheres->whereNotBetween($column, $low, $high);
+
+        return $this;
+    }
+
+    public function orWhereNotBetween(string $column, mixed $low, mixed $high): static
+    {
+        $this->wheres->orWhereNotBetween($column, $low, $high);
+
+        return $this;
+    }
+
+    public function whereExists(Query $query): static
+    {
+        $this->wheres->whereExists($query);
+
+        return $this;
+    }
+
+    public function orWhereExists(Query $query): static
+    {
+        $this->wheres->orWhereExists($query);
+
+        return $this;
+    }
+
+    public function whereNotExists(Query $query): static
+    {
+        $this->wheres->whereNotExists($query);
+
+        return $this;
+    }
+
+    public function orWhereNotExists(Query $query): static
+    {
+        $this->wheres->orWhereNotExists($query);
+
+        return $this;
+    }
+
+    /**
      * @param list<mixed> $params
      * @param 'AND'|'OR' $boolean
+     * @see Conditions::whereRaw()
      */
     public function whereRaw(string $sql, array $params = [], string $boolean = 'AND'): static
     {
-        $normalizedBoolean = self::assertAllowedBoolean($boolean);
+        $this->wheres->whereRaw($sql, $params, $boolean);
 
-        if (trim($sql) === '') {
-            throw new InvalidArgumentException(
-                'whereRaw() needs a SQL fragment: an empty one compiles to no predicate at all, which '
-                . 'would widen an update() or delete() to every row in the table.',
-            );
+        return $this;
+    }
+
+    /**
+     * @param Closure(Conditions): mixed $group
+     * @see Conditions::whereGroup()
+     */
+    public function whereGroup(Closure $group): static
+    {
+        $this->wheres->whereGroup($group);
+
+        return $this;
+    }
+
+    /**
+     * @param Closure(Conditions): mixed $group
+     */
+    public function orWhereGroup(Closure $group): static
+    {
+        $this->wheres->orWhereGroup($group);
+
+        return $this;
+    }
+
+    /** A join ON one column comparison: `join('users', 'users.id', '=', 'articles.author_id')`. */
+    public function join(
+        string $table,
+        string $first,
+        string $operator,
+        string $second,
+        string $type = 'INNER',
+        ?string $as = null,
+    ): static {
+        return $this->joinOn(
+            $table,
+            static fn (Conditions $on): Conditions => $on->whereColumn($first, $operator, $second),
+            $type,
+            $as,
+        );
+    }
+
+    public function leftJoin(string $table, string $first, string $operator, string $second, ?string $as = null): static
+    {
+        return $this->join($table, $first, $operator, $second, 'LEFT', $as);
+    }
+
+    /**
+     * A join whose ON clause is every predicate $on adds — column
+     * comparisons, bound values, groups, subqueries.
+     *
+     * @param Closure(Conditions): mixed $on
+     */
+    public function joinOn(string $table, Closure $on, string $type = 'INNER', ?string $as = null): static
+    {
+        $normalizedType = self::assertAllowedJoinType($type);
+
+        return $this->addJoin($normalizedType, $this->tableReference($table, $as), [], false, $on);
+    }
+
+    /**
+     * Joins a derived table: `JOIN (subquery) AS $as ON ...`.
+     *
+     * @param Closure(Conditions): mixed $on
+     */
+    public function joinSub(Query $query, string $as, Closure $on, string $type = 'INNER'): static
+    {
+        $normalizedType = self::assertAllowedJoinType($type);
+        $snapshot = $this->attach($query, 'joinSub()');
+
+        return $this->addJoin(
+            $normalizedType,
+            "({$snapshot->sql}) AS " . $this->dialect->quoteIdentifier($as),
+            $snapshot->params,
+            true,
+            $on,
+        );
+    }
+
+    public function crossJoin(string $table, ?string $as = null): static
+    {
+        $this->joins[] = [
+            'type' => 'CROSS',
+            'derived' => false,
+            'sql' => ' CROSS JOIN ' . $this->tableReference($table, $as),
+            'params' => [],
+        ];
+
+        return $this;
+    }
+
+    public function groupBy(string ...$columns): static
+    {
+        foreach ($columns as $column) {
+            $this->groups[] = ['sql' => $this->dialect->quoteIdentifier($column), 'params' => []];
         }
 
-        $this->wheres[] = ['type' => 'raw', 'sql' => $sql, 'params' => $params, 'boolean' => $normalizedBoolean];
+        return $this;
+    }
+
+    /**
+     * @param list<mixed> $params
+     */
+    public function groupByRaw(string $sql, array $params = []): static
+    {
+        $this->groups[] = ['sql' => $sql, 'params' => $params];
         $this->hasRawFragment = true;
 
         return $this;
     }
 
-    public function join(string $table, string $first, string $operator, string $second, string $type = 'INNER'): static
+    /**
+     * A HAVING comparison on a grouped column, with where()'s operators and
+     * null handling. Compare an aggregate through havingRaw().
+     *
+     * @param 'AND'|'OR' $boolean
+     */
+    public function having(string $column, string $operator, mixed $value, string $boolean = 'AND'): static
     {
-        $normalizedType = self::assertAllowedJoinType($type);
-        $normalizedOperator = self::assertAllowedOperator($operator);
-        $this->joins[] = ['type' => $normalizedType, 'table' => $table, 'first' => $first, 'operator' => $normalizedOperator, 'second' => $second];
+        $this->havings->where($column, $operator, $value, $boolean);
 
         return $this;
     }
 
-    public function leftJoin(string $table, string $first, string $operator, string $second): static
+    public function orHaving(string $column, string $operator, mixed $value): static
     {
-        return $this->join($table, $first, $operator, $second, 'LEFT');
+        $this->havings->orWhere($column, $operator, $value);
+
+        return $this;
+    }
+
+    /**
+     * @param list<mixed> $params
+     * @param 'AND'|'OR' $boolean
+     */
+    public function havingRaw(string $sql, array $params = [], string $boolean = 'AND'): static
+    {
+        if (trim($sql) === '') {
+            throw new InvalidArgumentException('havingRaw() needs a SQL fragment: an empty one compiles to an invalid HAVING clause.');
+        }
+
+        $this->havings->whereRaw($sql, $params, $boolean);
+
+        return $this;
     }
 
     public function orderBy(string $column, string $direction = 'ASC'): static
     {
-        $this->orders[] = $this->dialect->quoteIdentifier($column) . ' ' . self::assertAllowedDirection($direction);
+        $this->orders[] = [
+            'sql' => $this->dialect->quoteIdentifier($column) . ' ' . self::assertAllowedDirection($direction),
+            'params' => [],
+        ];
 
         return $this;
     }
 
-    public function orderByRaw(string $sql): static
+    /**
+     * @param list<mixed> $params
+     */
+    public function orderByRaw(string $sql, array $params = []): static
     {
-        $this->orders[] = $sql;
+        $this->orders[] = ['sql' => $sql, 'params' => $params];
         $this->hasRawFragment = true;
 
         return $this;
@@ -389,14 +651,68 @@ final class Query
     }
 
     /**
+     * Combines this query's rows with $query's. On a query carrying set
+     * operations, orderBy()/limit()/offset() apply to the combined result;
+     * $query's own stay inside its parentheses. Each further operation
+     * groups everything before it, so operations apply in call order.
+     */
+    public function union(Query $query, bool $all = false): static
+    {
+        return $this->addSetOperation('union()', 'UNION', $query, $all);
+    }
+
+    public function intersect(Query $query, bool $all = false): static
+    {
+        return $this->addSetOperation('intersect()', 'INTERSECT', $query, $all);
+    }
+
+    public function except(Query $query, bool $all = false): static
+    {
+        return $this->addSetOperation('except()', 'EXCEPT', $query, $all);
+    }
+
+    /**
+     * An exclusive row lock on the selected rows until the transaction
+     * ends. Admitted only on get(), first(), value() and pluck() of a
+     * Query built on an active SqlTransaction, over one table or inner
+     * joins — see assertLockIsPortable().
+     */
+    public function lockForUpdate(LockWait $wait = LockWait::Wait): static
+    {
+        $this->lock = match ($wait) {
+            LockWait::Wait => ' FOR UPDATE',
+            LockWait::NoWait => ' FOR UPDATE NOWAIT',
+            LockWait::SkipLocked => ' FOR UPDATE SKIP LOCKED',
+        };
+
+        return $this;
+    }
+
+    /**
+     * A shared row lock: other transactions may read the rows and take
+     * shared locks, but not modify them, until this transaction ends. It
+     * always waits. Same admitted domain as lockForUpdate().
+     */
+    public function lockForShare(): static
+    {
+        $this->lock = $this->dialect->sharedLock();
+
+        return $this;
+    }
+
+    /**
      * @template T of object
      * @param class-string<T>|null $dtoClass
-     * @return list<T>|list<array<string, mixed>>
+     * @return ($dtoClass is null ? list<array<string, mixed>> : list<T>)
      */
     public function get(?string $dtoClass = null): array
     {
+        if ($this->lock !== null && !($this->link instanceof SqlTransaction && $this->link->isActive())) {
+            throw QueryBuilderException::lockNeedsATransaction();
+        }
+
         $compiled = $this->toSelectSql();
-        $result = $this->run($compiled->sql, $compiled->params);
+        $result = $this->run($compiled->sql, $compiled->params, $this->containsRawSql());
 
         $rows = [];
 
@@ -410,7 +726,7 @@ final class Query
     /**
      * @template T of object
      * @param class-string<T>|null $dtoClass
-     * @return T|array<string, mixed>|null
+     * @return ($dtoClass is null ? array<string, mixed>|null : T|null)
      */
     public function first(?string $dtoClass = null): object|array|null
     {
@@ -420,33 +736,99 @@ final class Query
         return $one->get($dtoClass)[0] ?? null;
     }
 
+    /**
+     * The $column value of the first row, or null when there is none. The
+     * column is read from the row by its result name, so select it under
+     * that name; the projection is not changed.
+     */
+    public function value(string $column): mixed
+    {
+        $row = $this->first();
+
+        return $row === null ? null : self::readColumn($row, $column, 'value()');
+    }
+
+    /**
+     * The $column value of every row, in result order, read by result
+     * name like value().
+     *
+     * @return list<mixed>
+     */
+    public function pluck(string $column): array
+    {
+        $values = [];
+
+        foreach ($this->get() as $row) {
+            $values[] = self::readColumn($row, $column, 'pluck()');
+        }
+
+        return $values;
+    }
+
+    /** Whether the query returns at least one row. */
+    public function exists(): bool
+    {
+        $this->assertUnlocked('exists()');
+
+        $with = $this->compileWith();
+        $query = $this->compileQueryExpression(true);
+        $result = $this->run(
+            $with->sql . "SELECT CASE WHEN EXISTS ({$query->sql}) THEN 1 ELSE 0 END AS aggregate",
+            [...$with->params, ...$query->params],
+            $this->containsRawSql(),
+        );
+
+        return (int) ($result->fetchRow()['aggregate'] ?? 0) === 1;
+    }
+
+    /**
+     * The number of rows the query returns, ignoring its order, limit and
+     * offset. A distinct, grouped, HAVING or set-operation query is counted
+     * by its logical result rows — see compileAggregate().
+     */
     public function count(): int
     {
-        $compiled = $this->toSelectSql(countOnly: true);
-        $result = $this->run($compiled->sql, $compiled->params);
+        return (int) ($this->aggregate('count()', 'COUNT(*)') ?? 0);
+    }
 
-        /** @var array<string, mixed>|null $row */
-        $row = $result->fetchRow();
+    /** SUM($column) over the same rows count() counts; null when there are none. */
+    public function sum(string $column): int|float|string|null
+    {
+        return $this->aggregate('sum()', 'SUM(' . $this->dialect->quoteIdentifier($column) . ')');
+    }
 
-        return (int) ($row['aggregate'] ?? 0);
+    public function min(string $column): int|float|string|null
+    {
+        return $this->aggregate('min()', 'MIN(' . $this->dialect->quoteIdentifier($column) . ')');
+    }
+
+    public function max(string $column): int|float|string|null
+    {
+        return $this->aggregate('max()', 'MAX(' . $this->dialect->quoteIdentifier($column) . ')');
+    }
+
+    public function avg(string $column): int|float|string|null
+    {
+        return $this->aggregate('avg()', 'AVG(' . $this->dialect->quoteIdentifier($column) . ')');
     }
 
     /**
      * Offset-based pagination: page()/perPage(), with a total count and
      * page count. The page's own limit and offset are applied to a
-     * clone, and count() reads the same predicates and joins without
-     * them, so the two executions describe one logical query and the
-     * caller's builder is untouched by either.
+     * clone, and count() reads the same logical result without them, so
+     * the two executions describe one logical query and the caller's
+     * builder is untouched by either.
      *
      * An order is required: without one the server may return rows in
      * any order it likes, and page 2 can then repeat or skip rows from
      * page 1.
      *
-     * @template T of object
-     * @param class-string<T>|null $dtoClass
+     * @param class-string|null $dtoClass
      */
     public function paginate(int $perPage, int $page = 1, ?string $dtoClass = null): Paginator
     {
+        $this->assertUnlocked('paginate()');
+
         if ($perPage < 1) {
             throw InvalidPaginationException::nonPositivePerPage('paginate()', $perPage);
         }
@@ -550,7 +932,7 @@ final class Query
 
         $cursorRowKey = $cursorAlias ?? $cursorColumn;
         $compiled = $page->orderBy($cursorColumn)->limit($perPage + 1)->toSelectSql();
-        $result = $page->run($compiled->sql, $compiled->params);
+        $result = $page->run($compiled->sql, $compiled->params, $page->containsRawSql());
 
         /** @var list<array<string, mixed>> $rows */
         $rows = [];
@@ -594,6 +976,12 @@ final class Query
         string $cursorColumn,
         ?string $cursorAlias,
     ): void {
+        $this->assertUnlocked('cursorPaginate()');
+
+        if ($this->setOperations !== []) {
+            throw QueryBuilderException::cursorPaginationOverSetOperation();
+        }
+
         if ($perPage < 1) {
             throw InvalidPaginationException::nonPositivePerPage('cursorPaginate()', $perPage);
         }
@@ -680,273 +1068,587 @@ final class Query
     }
 
     /**
-     * @param array<string, mixed> $data
+     * Inserts one row (a column => value map) or a batch (a list of such
+     * maps, every one naming identical columns in identical order) as one
+     * statement.
+     *
+     * @param array<string, mixed>|list<array<string, mixed>> $values
      */
-    public function insert(array $data): void
+    public function insert(array $values): void
     {
-        if ($data === []) {
-            throw new InvalidArgumentException(
-                'insert() needs at least one column — an empty array compiles to invalid SQL '
-                . '("INSERT INTO t () VALUES ()"). Pass the columns you want set to their default '
-                . 'values explicitly if that\'s the intent; this class has no DEFAULT VALUES shorthand.',
-            );
-        }
+        [$columns, $rows] = $this->rowsFor('insert()', $values);
+        $compiled = $this->compileInsert($columns, $rows, '');
 
-        $columns = array_keys($data);
-
-        $sql = sprintf(
-            'INSERT INTO %s (%s) VALUES (%s)',
-            $this->dialect->quoteIdentifier($this->table),
-            implode(', ', array_map($this->dialect->quoteIdentifier(...), $columns)),
-            implode(', ', array_fill(0, count($columns), '?')),
-        );
-
-        $this->run($sql, array_values($data));
+        $this->run($compiled->sql, $compiled->params, false);
     }
 
     /**
-     * @param array<string, mixed> $data
+     * Inserts one row and returns $primaryKey's generated value.
+     *
+     * @param array<string, mixed> $values
      */
-    public function insertGetId(array $data, string $primaryKey = 'id'): int|string|null
+    public function insertGetId(array $values, string $primaryKey = 'id'): int|string|null
     {
-        if ($data === []) {
+        if (self::isBatch($values)) {
             throw new InvalidArgumentException(
-                'insertGetId() needs at least one column — an empty array compiles to invalid SQL.',
+                'insertGetId() inserts one row: pass a single column => value map, and insert() for a batch.',
             );
         }
 
-        $compiled = $this->dialect->insertGetIdQuery($this->table, $data, $primaryKey);
-        $result = $this->run($compiled->sql, $compiled->params);
+        [$columns, $rows] = $this->rowsFor('insertGetId()', $values);
+        $compiled = $this->compileInsert($columns, $rows, $this->dialect->insertGetIdClause($primaryKey));
+        $result = $this->run($compiled->sql, $compiled->params, false);
 
         return $this->dialect->extractInsertedId($result, $primaryKey);
     }
 
     /**
-     * @param array<string, mixed> $data
+     * `INSERT INTO table (columns) <select>` and returns the affected-row
+     * count. A WITH clause on $select stays in front of its SELECT, the
+     * placement every target accepts inside INSERT.
+     *
+     * @param list<string> $columns
      */
-    public function update(array $data): int
+    public function insertUsing(array $columns, Query $select): int
     {
-        $compiled = $this->toUpdateSql($data);
-        $result = $this->run($compiled->sql, $compiled->params);
+        $this->assertOnlyATable('insertUsing()');
 
-        return $result->getRowCount() ?? 0;
+        if ($columns === []) {
+            throw new InvalidArgumentException('insertUsing() needs at least one column to insert into.');
+        }
+
+        if ($select->dialect::class !== $this->dialect::class) {
+            throw QueryBuilderException::subqueryFromAnotherDialect('insertUsing()');
+        }
+
+        if ($select->lock !== null) {
+            throw QueryBuilderException::subqueryCarriesLock('insertUsing()');
+        }
+
+        $source = $select->toSelectSql();
+        $sql = 'INSERT INTO ' . $this->dialect->quoteIdentifier($this->table)
+            . ' (' . implode(', ', array_map($this->dialect->quoteIdentifier(...), $columns)) . ') ' . $source->sql;
+
+        return $this->run($sql, $source->params, $select->containsRawSql())->getRowCount() ?? 0;
+    }
+
+    /**
+     * Inserts the row or batch, skipping every row that conflicts with a
+     * unique key, and returns the number of rows inserted. Any other error
+     * still fails the whole statement.
+     *
+     * @param array<string, mixed>|list<array<string, mixed>> $values
+     */
+    public function insertOrIgnore(array $values): int
+    {
+        [$columns, $rows] = $this->rowsFor('insertOrIgnore()', $values);
+        $compiled = $this->compileInsert($columns, $rows, $this->dialect->insertOrIgnoreClause($columns));
+
+        return $this->run($compiled->sql, $compiled->params, false)->getRowCount() ?? 0;
+    }
+
+    /**
+     * Inserts the row or batch; a row conflicting with a unique key instead
+     * updates the $update columns of the existing row to the values it
+     * tried to insert. Returns the server's affected-row count.
+     *
+     * PostgreSQL resolves only a conflict on exactly $uniqueBy's unique
+     * constraint. The MySQL family resolves a conflict on any unique key
+     * and counts an updated row as 2.
+     *
+     * @param array<string, mixed>|list<array<string, mixed>> $values
+     * @param list<string> $uniqueBy
+     * @param list<string> $update
+     */
+    public function upsert(array $values, array $uniqueBy, array $update): int
+    {
+        [$columns, $rows] = $this->rowsFor('upsert()', $values);
+
+        if ($uniqueBy === []) {
+            throw new InvalidArgumentException('upsert() needs at least one column in $uniqueBy.');
+        }
+
+        if ($update === []) {
+            throw new InvalidArgumentException('upsert() needs at least one column in $update.');
+        }
+
+        foreach (['$uniqueBy' => $uniqueBy, '$update' => $update] as $argument => $names) {
+            foreach ($names as $name) {
+                if (!in_array($name, $columns, true)) {
+                    throw new InvalidArgumentException(
+                        "upsert()'s {$argument} names \"{$name}\", which is not one of the inserted columns.",
+                    );
+                }
+            }
+        }
+
+        $compiled = $this->compileInsert($columns, $rows, $this->dialect->upsertClause($uniqueBy, $update));
+
+        return $this->run($compiled->sql, $compiled->params, false)->getRowCount() ?? 0;
+    }
+
+    /**
+     * @param array<string, mixed> $values
+     */
+    public function update(array $values): int
+    {
+        $compiled = $this->toUpdateSql($values);
+
+        return $this->run($compiled->sql, $compiled->params, $this->containsRawSql())->getRowCount() ?? 0;
+    }
+
+    /**
+     * `SET column = column + amount`, plus any $extra column => value
+     * assignments, under update()'s narrowing rules.
+     *
+     * @param array<string, mixed> $extra
+     */
+    public function increment(string $column, int|float $amount = 1, array $extra = []): int
+    {
+        return $this->arithmetic('increment()', $column, '+', $amount, $extra);
+    }
+
+    /**
+     * @param array<string, mixed> $extra
+     */
+    public function decrement(string $column, int|float $amount = 1, array $extra = []): int
+    {
+        return $this->arithmetic('decrement()', $column, '-', $amount, $extra);
     }
 
     public function delete(): int
     {
         $compiled = $this->toDeleteSql();
-        $result = $this->run($compiled->sql, $compiled->params);
 
-        return $result->getRowCount() ?? 0;
+        return $this->run($compiled->sql, $compiled->params, $this->containsRawSql())->getRowCount() ?? 0;
     }
 
-    public function toSelectSql(bool $countOnly = false): CompiledQuery
+    public function toSelectSql(): CompiledQuery
     {
-        $columns = $countOnly ? 'COUNT(*) as aggregate' : $this->compileSelectColumns();
+        $this->assertLockIsPortable();
 
-        $sql = "SELECT {$columns} FROM " . $this->dialect->quoteIdentifier($this->table);
-        $bindings = [];
+        $with = $this->compileWith();
+        $query = $this->compileQueryExpression(true);
 
-        foreach ($this->joins as $join) {
-            $sql .= " {$join['type']} JOIN " . $this->dialect->quoteIdentifier($join['table'])
-                . ' ON ' . $this->dialect->quoteIdentifier($join['first'])
-                . " {$join['operator']} " . $this->dialect->quoteIdentifier($join['second']);
-        }
-
-        $where = $this->compileWheres();
-        $sql .= $where->sql;
-        array_push($bindings, ...$where->params);
-
-        if (!$countOnly) {
-            if ($this->orders !== []) {
-                $sql .= ' ORDER BY ' . implode(', ', $this->orders);
-            }
-
-            // Interpolated directly, not bound as "?": both are hard-typed
-            // PHP int here, never a raw string, so there's no injection
-            // surface to bind against in the first place.
-            if ($this->limitValue !== null) {
-                $sql .= " LIMIT {$this->limitValue}";
-            }
-
-            if ($this->offsetValue !== null) {
-                $sql .= " OFFSET {$this->offsetValue}";
-            }
-        }
-
-        return new CompiledQuery($sql, $bindings);
+        return new CompiledQuery($with->sql . $query->sql . ($this->lock ?? ''), [...$with->params, ...$query->params]);
     }
 
     /**
-     * @param array<string, mixed> $data
+     * @param array<string, mixed> $values
      */
-    public function toUpdateSql(array $data): CompiledQuery
+    public function toUpdateSql(array $values): CompiledQuery
     {
         $this->assertMutationIsNarrowed('update()');
 
-        if ($data === []) {
+        if ($values === []) {
             throw new InvalidArgumentException(
                 'update() needs at least one column — an empty array compiles to invalid SQL '
                 . '("UPDATE t SET  WHERE ...").',
             );
         }
 
-        $sets = implode(', ', array_map(
-            fn (string $column) => $this->dialect->quoteIdentifier($column) . ' = ?',
-            array_keys($data),
-        ));
-
-        $sql = 'UPDATE ' . $this->dialect->quoteIdentifier($this->table) . " SET {$sets}";
-        $bindings = array_values($data);
-
-        $where = $this->compileWheres();
-        $sql .= $where->sql;
-        array_push($bindings, ...$where->params);
-
-        return new CompiledQuery($sql, $bindings);
+        return $this->compileUpdate([], [], $values);
     }
 
     public function toDeleteSql(): CompiledQuery
     {
         $this->assertMutationIsNarrowed('delete()');
 
-        $sql = 'DELETE FROM ' . $this->dialect->quoteIdentifier($this->table);
-        $where = $this->compileWheres();
+        $where = $this->wheres->compile();
 
-        return new CompiledQuery($sql . $where->sql, $where->params);
+        return new CompiledQuery(
+            'DELETE FROM ' . $this->dialect->quoteIdentifier($this->table) . ' WHERE ' . $where->sql,
+            $where->params,
+        );
     }
 
     /**
-     * UPDATE and DELETE compile the table and the WHERE clause, nothing
-     * else. A query with no predicate at all matches every row, and any
-     * other accumulated state would be dropped from the statement —
-     * turning a mutation the caller narrowed with select(), join(),
-     * orderBy(), limit() or offset() into one that matches every row the
-     * WHERE clause alone allows. Both are refused instead. A deliberate
-     * whole-table statement, like a joined, ordered or limited mutation,
-     * runs as raw SQL through the link itself.
+     * @param array<string, mixed> $extra
      */
-    private function assertMutationIsNarrowed(string $method): void
+    private function arithmetic(string $method, string $column, string $operator, int|float $amount, array $extra): int
     {
-        if ($this->wheres === []) {
-            throw QueryBuilderException::mutationNeedsAPredicate($method);
+        $this->assertMutationIsNarrowed($method);
+
+        if (array_key_exists($column, $extra)) {
+            throw new InvalidArgumentException(
+                "{$method} cannot also assign \"{$column}\" through \$extra: one statement cannot set a column twice.",
+            );
         }
 
-        $unsupported = [];
+        $quoted = $this->dialect->quoteIdentifier($column);
+        $compiled = $this->compileUpdate(["{$quoted} = {$quoted} {$operator} ?"], [$amount], $extra);
 
-        if ($this->selectColumns !== ['*'] || $this->selectRawExpressions !== []) {
-            $unsupported[] = 'select()/selectRaw()';
+        return $this->run($compiled->sql, $compiled->params, $this->containsRawSql())->getRowCount() ?? 0;
+    }
+
+    /**
+     * @param list<string> $sets already-rendered assignments
+     * @param list<mixed> $params their bindings
+     * @param array<string, mixed> $values column => value assignments appended after them
+     */
+    private function compileUpdate(array $sets, array $params, array $values): CompiledQuery
+    {
+        foreach ($values as $column => $value) {
+            $sets[] = $this->dialect->quoteIdentifier((string) $column) . ' = ?';
+            $params[] = $value;
         }
 
-        if ($this->joins !== []) {
-            $unsupported[] = 'join()/leftJoin()';
+        $where = $this->wheres->compile();
+
+        return new CompiledQuery(
+            'UPDATE ' . $this->dialect->quoteIdentifier($this->table) . ' SET ' . implode(', ', $sets)
+            . ' WHERE ' . $where->sql,
+            [...$params, ...$where->params],
+        );
+    }
+
+    /**
+     * Whether $values is shaped as a batch (a non-empty list of rows)
+     * rather than one column => value map. Typed for any array, since a
+     * caller can pass a batch where a single row is documented.
+     *
+     * @param array<array-key, mixed> $values
+     */
+    private static function isBatch(array $values): bool
+    {
+        return $values !== [] && array_is_list($values);
+    }
+
+    /**
+     * @param array<array-key, mixed> $values
+     * @return array{0: non-empty-list<string>, 1: non-empty-list<list<mixed>>}
+     */
+    private function rowsFor(string $method, array $values): array
+    {
+        $this->assertOnlyATable($method);
+
+        if ($values === []) {
+            throw new InvalidArgumentException(
+                "{$method} needs at least one column — an empty array compiles to invalid SQL "
+                . '("INSERT INTO t () VALUES ()"). Pass the columns you want set to their default '
+                . 'values explicitly if that\'s the intent; this class has no DEFAULT VALUES shorthand.',
+            );
+        }
+
+        $rows = array_is_list($values) ? $values : [$values];
+        $columns = [];
+        $matrix = [];
+
+        foreach ($rows as $i => $row) {
+            if (!is_array($row) || $row === []) {
+                throw new InvalidArgumentException("{$method} row {$i} must be a non-empty column => value map.");
+            }
+
+            $keys = array_map(static fn (int|string $key): string => (string) $key, array_keys($row));
+
+            if ($i === 0) {
+                $columns = $keys;
+            } elseif ($keys !== $columns) {
+                throw new InvalidArgumentException(
+                    "{$method} row {$i} does not name the same columns in the same order as row 0. Every row of "
+                    . 'a batch shares one column list.',
+                );
+            }
+
+            $matrix[] = array_values($row);
+        }
+
+        $placeholders = count($matrix) * count($columns);
+
+        if ($placeholders > self::MAX_PLACEHOLDERS) {
+            throw new InvalidArgumentException(
+                "{$method} would bind {$placeholders} values in one statement; MySQL, MariaDB and PostgreSQL "
+                . 'accept at most ' . self::MAX_PLACEHOLDERS . '. Insert fewer rows per call.',
+            );
+        }
+
+        /** @var non-empty-list<string> $columns */
+        return [$columns, $matrix];
+    }
+
+    /**
+     * @param non-empty-list<string> $columns
+     * @param non-empty-list<list<mixed>> $rows
+     */
+    private function compileInsert(array $columns, array $rows, string $suffix): CompiledQuery
+    {
+        $tuple = '(' . implode(', ', array_fill(0, count($columns), '?')) . ')';
+
+        return new CompiledQuery(
+            'INSERT INTO ' . $this->dialect->quoteIdentifier($this->table)
+            . ' (' . implode(', ', array_map($this->dialect->quoteIdentifier(...), $columns)) . ') VALUES '
+            . implode(', ', array_fill(0, count($rows), $tuple)) . $suffix,
+            array_merge(...$rows),
+        );
+    }
+
+    /**
+     * Compiles this query for embedding in $parent's SQL. A CTE belongs
+     * to the outermost query and a lock to the outermost select, so a
+     * Query carrying either is refused rather than nested.
+     */
+    private function snapshot(Dialect $parent, string $method): Snapshot
+    {
+        if ($this->dialect::class !== $parent::class) {
+            throw QueryBuilderException::subqueryFromAnotherDialect($method);
+        }
+
+        if ($this->ctes !== []) {
+            throw QueryBuilderException::subqueryCarriesCte($method);
+        }
+
+        if ($this->lock !== null) {
+            throw QueryBuilderException::subqueryCarriesLock($method);
+        }
+
+        $compiled = $this->compileQueryExpression(true);
+
+        return new Snapshot($compiled->sql, $compiled->params, $this->containsRawSql(), $this->isLimited());
+    }
+
+    private function attach(Query $query, string $method): Snapshot
+    {
+        $snapshot = ($this->capture)($query, $method);
+        $this->hasRawFragment = $this->hasRawFragment || $snapshot->hasRawFragment;
+
+        return $snapshot;
+    }
+
+    private function isLimited(): bool
+    {
+        if ($this->limitValue !== null || $this->offsetValue !== null) {
+            return true;
+        }
+
+        foreach ($this->setOperations as $operation) {
+            if ($operation['isLimited']) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param list<string> $columns
+     */
+    private function addCte(string $method, string $name, Query $query, array $columns, bool $recursive): static
+    {
+        $snapshot = $this->attach($query, $method);
+        $sql = $this->dialect->quoteIdentifier($name);
+
+        if ($columns !== []) {
+            $sql .= ' (' . implode(', ', array_map($this->dialect->quoteIdentifier(...), $columns)) . ')';
+        }
+
+        $this->ctes[] = ['sql' => "{$sql} AS ({$snapshot->sql})", 'params' => $snapshot->params, 'recursive' => $recursive];
+
+        return $this;
+    }
+
+    /**
+     * @param 'INNER'|'LEFT'|'RIGHT' $type
+     * @param list<mixed> $params the source's own bindings
+     * @param Closure(Conditions): mixed $on
+     */
+    private function addJoin(string $type, string $source, array $params, bool $derived, Closure $on): static
+    {
+        $conditions = new Conditions($this->dialect, $this->capture);
+        $on($conditions);
+
+        if ($conditions->isEmpty()) {
+            throw new InvalidArgumentException(
+                "A {$type} JOIN needs at least one ON predicate. Use crossJoin() to join every row with every row.",
+            );
+        }
+
+        $compiled = $conditions->compile();
+        $this->joins[] = [
+            'type' => $type,
+            'derived' => $derived,
+            'sql' => " {$type} JOIN {$source} ON {$compiled->sql}",
+            'params' => [...$params, ...$compiled->params],
+        ];
+        $this->hasRawFragment = $this->hasRawFragment || $conditions->hasRawFragment();
+
+        return $this;
+    }
+
+    private function addSetOperation(string $method, string $keyword, Query $query, bool $all): static
+    {
+        $snapshot = $this->attach($query, $method);
+        $this->setOperations[] = [
+            'sql' => " {$keyword}" . ($all ? ' ALL' : '') . " ({$snapshot->sql})",
+            'params' => $snapshot->params,
+            'isLimited' => $snapshot->isLimited,
+        ];
+
+        return $this;
+    }
+
+    private function tableReference(string $table, ?string $as): string
+    {
+        $reference = $this->dialect->quoteIdentifier($table);
+
+        return $as === null ? $reference : $reference . ' AS ' . $this->dialect->quoteIdentifier($as);
+    }
+
+    private function aggregate(string $method, string $expression): int|float|string|null
+    {
+        $this->assertUnlocked($method);
+
+        $compiled = $this->compileAggregate($expression);
+        $row = $this->run($compiled->sql, $compiled->params, $this->containsRawSql())->fetchRow();
+
+        /** @var int|float|string|null $value an aggregate column is a scalar or NULL in every driver's row */
+        $value = $row['aggregate'] ?? null;
+
+        return $value;
+    }
+
+    /**
+     * A plain query aggregates its FROM, joins and WHERE directly, with no
+     * projection and so none of its bindings. A distinct, grouped, HAVING
+     * or set-operation query's logical result is its projected rows, so
+     * the aggregate reads them from a derived table that keeps every
+     * projection, group, HAVING and operand binding. Either way the outer
+     * order, limit and offset play no part.
+     */
+    private function compileAggregate(string $expression): CompiledQuery
+    {
+        $with = $this->compileWith();
+
+        if ($this->distinct || $this->groups !== [] || !$this->havings->isEmpty() || $this->setOperations !== []) {
+            $inner = $this->compileQueryExpression(false);
+            $query = new CompiledQuery(
+                "SELECT {$expression} AS aggregate FROM ({$inner->sql}) AS aggregate_source",
+                $inner->params,
+            );
+        } else {
+            $query = $this->compileBody(new CompiledQuery("{$expression} AS aggregate", []), false);
+        }
+
+        return new CompiledQuery($with->sql . $query->sql, [...$with->params, ...$query->params]);
+    }
+
+    private function compileWith(): CompiledQuery
+    {
+        if ($this->ctes === []) {
+            return new CompiledQuery('', []);
+        }
+
+        $definitions = [];
+        $params = [];
+        $recursive = false;
+
+        foreach ($this->ctes as $cte) {
+            $definitions[] = $cte['sql'];
+            array_push($params, ...$cte['params']);
+            $recursive = $recursive || $cte['recursive'];
+        }
+
+        return new CompiledQuery('WITH ' . ($recursive ? 'RECURSIVE ' : '') . implode(', ', $definitions) . ' ', $params);
+    }
+
+    /**
+     * The select as one query expression: its body, its set operations
+     * and — when $outer — the ORDER BY, LIMIT and OFFSET of the whole
+     * result. Never the WITH clause or the lock, so a snapshot, an
+     * aggregate and exists() can embed exactly this.
+     */
+    private function compileQueryExpression(bool $outer): CompiledQuery
+    {
+        $body = $this->compileBody($this->compileSelectColumns(), $this->distinct);
+        $sql = $body->sql;
+        $params = $body->params;
+
+        if ($this->setOperations !== []) {
+            $sql = "({$sql})";
+
+            foreach ($this->setOperations as $i => $operation) {
+                if ($i > 0) {
+                    $sql = "({$sql})";
+                }
+
+                $sql .= $operation['sql'];
+                array_push($params, ...$operation['params']);
+            }
+        }
+
+        if (!$outer) {
+            return new CompiledQuery($sql, $params);
         }
 
         if ($this->orders !== []) {
-            $unsupported[] = 'orderBy()/orderByRaw()';
+            $sql .= ' ORDER BY ' . implode(', ', array_column($this->orders, 'sql'));
+
+            foreach ($this->orders as $order) {
+                array_push($params, ...$order['params']);
+            }
         }
 
-        if ($this->limitValue !== null) {
-            $unsupported[] = 'limit()';
-        }
-
-        if ($this->offsetValue !== null) {
-            $unsupported[] = 'offset()';
-        }
-
-        if ($unsupported !== []) {
-            throw QueryBuilderException::unsupportedMutationClauses($method, $unsupported);
-        }
+        // Interpolated rather than bound: both are validated PHP ints.
+        return new CompiledQuery($sql . $this->dialect->limitOffset($this->limitValue, $this->offsetValue), $params);
     }
 
-    private static function assertAllowedOperator(string $operator): string
+    private function compileBody(CompiledQuery $projection, bool $distinct): CompiledQuery
     {
-        $normalized = strtoupper(trim($operator));
+        $sql = 'SELECT ' . ($distinct ? 'DISTINCT ' : '') . $projection->sql . ' FROM ';
+        $params = $projection->params;
 
-        if (!in_array($normalized, self::ALLOWED_WHERE_OPERATORS, true)) {
-            throw new InvalidArgumentException(
-                "Operator \"{$operator}\" is not allowed. Use one of: " . implode(', ', self::ALLOWED_WHERE_OPERATORS) . '.',
-            );
+        if ($this->fromSub !== null) {
+            $sql .= $this->fromSub['sql'];
+            array_push($params, ...$this->fromSub['params']);
+        } else {
+            $sql .= $this->tableReference($this->table, $this->tableAlias);
         }
 
-        return $normalized;
+        foreach ($this->joins as $join) {
+            $sql .= $join['sql'];
+            array_push($params, ...$join['params']);
+        }
+
+        $where = $this->compileWhere();
+        $sql .= $where->sql;
+        array_push($params, ...$where->params);
+
+        if ($this->groups !== []) {
+            $sql .= ' GROUP BY ' . implode(', ', array_column($this->groups, 'sql'));
+
+            foreach ($this->groups as $group) {
+                array_push($params, ...$group['params']);
+            }
+        }
+
+        if (!$this->havings->isEmpty()) {
+            $having = $this->havings->compile();
+            $sql .= ' HAVING ' . $having->sql;
+            array_push($params, ...$having->params);
+        }
+
+        return new CompiledQuery($sql, $params);
     }
 
     /**
-     * @return 'IS NULL'|'IS NOT NULL'
-     */
-    private static function nullOperatorFor(string $operator): string
-    {
-        return match ($operator) {
-            '=' => 'IS NULL',
-            '!=', '<>' => 'IS NOT NULL',
-            default => throw new InvalidArgumentException(
-                "Operator \"{$operator}\" cannot be used with a null value. SQL compares null through "
-                . 'IS NULL (=) and IS NOT NULL (!=, <>) only; every other comparison against null is '
-                . 'never true for any row.',
-            ),
-        };
-    }
-
-    private static function assertAllowedDirection(string $direction): string
-    {
-        $normalized = strtoupper(trim($direction));
-
-        if (!in_array($normalized, self::ALLOWED_ORDER_DIRECTIONS, true)) {
-            throw new InvalidArgumentException(
-                "Order direction \"{$direction}\" is not allowed. Use one of: " . implode(', ', self::ALLOWED_ORDER_DIRECTIONS) . '.',
-            );
-        }
-
-        return $normalized;
-    }
-
-    private static function assertAllowedJoinType(string $type): string
-    {
-        $normalized = strtoupper(trim($type));
-
-        if (!in_array($normalized, self::ALLOWED_JOIN_TYPES, true)) {
-            throw new InvalidArgumentException(
-                "Join type \"{$type}\" is not allowed. Use one of: " . implode(', ', self::ALLOWED_JOIN_TYPES) . '.',
-            );
-        }
-
-        return $normalized;
-    }
-
-    /**
-     * @return 'AND'|'OR'
-     */
-    private static function assertAllowedBoolean(string $boolean): string
-    {
-        $normalized = strtoupper(trim($boolean));
-
-        if (!in_array($normalized, self::ALLOWED_WHERE_BOOLEANS, true)) {
-            throw new InvalidArgumentException(
-                "Where boolean \"{$boolean}\" is not allowed. Use one of: " . implode(', ', self::ALLOWED_WHERE_BOOLEANS) . '.',
-            );
-        }
-
-        /** @var 'AND'|'OR' $normalized */
-        return $normalized;
-    }
-
-    /**
-     * The default "*" is dropped once anything explicit — select() or
-     * selectRaw() — has been specified: a caller reaching only for
-     * selectRaw('COUNT(*) AS total') wants exactly that, not also every
-     * column. Once select() has been called $selectColumns is no longer
-     * literally ['*'], so the explicit columns and the raw expressions
+     * The default "*" is dropped once anything explicit — select(),
+     * selectRaw() or selectSub() — has been specified: a caller reaching
+     * only for selectRaw('COUNT(*) AS total') wants exactly that, not also
+     * every column. Once select() has been called $selectColumns is no
+     * longer literally ['*'], so the explicit columns and the expressions
      * combine normally.
      */
-    private function compileSelectColumns(): string
+    private function compileSelectColumns(): CompiledQuery
     {
-        $quoted = array_map(
+        $expressions = array_map(
             $this->compileSelectColumn(...),
-            $this->selectColumns === ['*'] && $this->selectRawExpressions !== [] ? [] : $this->selectColumns,
+            $this->selectColumns === ['*'] && $this->selectExpressions !== [] ? [] : $this->selectColumns,
         );
+        $params = [];
 
-        $expressions = [...$quoted, ...$this->selectRawExpressions];
+        foreach ($this->selectExpressions as $expression) {
+            $expressions[] = $expression['sql'];
+            array_push($params, ...$expression['params']);
+        }
 
         // Appended after that rule: a cursor alias is this class's own
         // addition, not something the caller asked to see, so it must
@@ -956,7 +1658,7 @@ final class Query
             $expressions[] = $this->cursorAliasExpression;
         }
 
-        return implode(', ', $expressions);
+        return new CompiledQuery(implode(', ', $expressions), $params);
     }
 
     /**
@@ -979,52 +1681,11 @@ final class Query
         return $this->dialect->quoteIdentifier($column);
     }
 
-    private function compileWheres(): CompiledQuery
+    private function compileWhere(): CompiledQuery
     {
-        $sqlParts = [];
-        $bindings = [];
-
-        foreach ($this->wheres as $i => $where) {
-            $prefix = $i === 0 ? '' : " {$where['boolean']} ";
-
-            if ($where['type'] === 'raw') {
-                $sqlParts[] = $prefix . $where['sql'];
-                array_push($bindings, ...$where['params']);
-
-                continue;
-            }
-
-            if ($where['type'] === 'null') {
-                // No placeholder: SQL has no value to compare a null
-                // against, only IS NULL / IS NOT NULL to test for one.
-                $sqlParts[] = $prefix . $this->dialect->quoteIdentifier($where['column']) . " {$where['operator']}";
-
-                continue;
-            }
-
-            if ($where['type'] === 'in') {
-                if ($where['values'] === []) {
-                    // IN () is syntactically invalid on both MySQL and
-                    // Postgres — a constant-false predicate is the correct
-                    // meaning of "column is in this empty set of values"
-                    // and needs no bound parameters of its own.
-                    $sqlParts[] = $prefix . '1 = 0';
-
-                    continue;
-                }
-
-                $placeholders = implode(', ', array_fill(0, count($where['values']), '?'));
-                $sqlParts[] = $prefix . $this->dialect->quoteIdentifier($where['column']) . " IN ({$placeholders})";
-                array_push($bindings, ...$where['values']);
-
-                continue;
-            }
-
-            $sqlParts[] = $prefix . $this->dialect->quoteIdentifier($where['column']) . " {$where['operator']} ?";
-            $bindings[] = $where['value'];
-        }
-
-        $predicate = implode('', $sqlParts);
+        $where = $this->wheres->compile();
+        $predicate = $where->sql;
+        $params = $where->params;
 
         if ($this->cursorPredicate !== null) {
             // Parenthesized: an OR anywhere in the caller's own
@@ -1032,13 +1693,165 @@ final class Query
             // the cursor filtering the last OR arm alone.
             $cursor = $this->dialect->quoteIdentifier($this->cursorPredicate['column']) . ' > ?';
             $predicate = $predicate === '' ? $cursor : "({$predicate}) AND {$cursor}";
-            $bindings[] = $this->cursorPredicate['value'];
+            $params[] = $this->cursorPredicate['value'];
         }
 
-        if ($predicate === '') {
-            return new CompiledQuery('', []);
+        return $predicate === '' ? new CompiledQuery('', []) : new CompiledQuery(' WHERE ' . $predicate, $params);
+    }
+
+    /**
+     * UPDATE and DELETE compile the table and the WHERE clause, nothing
+     * else. A query with no predicate at all matches every row, and any
+     * other accumulated state would be dropped from the statement —
+     * turning a mutation the caller narrowed with a join, limit or lock
+     * into one that matches every row the WHERE clause alone allows. Both
+     * are refused instead. A deliberate whole-table statement, like a
+     * joined, ordered or limited mutation, runs as raw SQL through the
+     * link itself.
+     */
+    private function assertMutationIsNarrowed(string $method): void
+    {
+        if ($this->wheres->isEmpty()) {
+            throw QueryBuilderException::mutationNeedsAPredicate($method);
         }
 
-        return new CompiledQuery(' WHERE ' . $predicate, $bindings);
+        $unsupported = $this->clausesBeyondTableAndWhere();
+
+        if ($unsupported !== []) {
+            throw QueryBuilderException::unsupportedMutationClauses($method, $unsupported);
+        }
+    }
+
+    /** An INSERT compiles the table and its rows; every other clause would be dropped. */
+    private function assertOnlyATable(string $method): void
+    {
+        $unsupported = $this->clausesBeyondTableAndWhere();
+
+        if (!$this->wheres->isEmpty()) {
+            array_unshift($unsupported, 'where predicates');
+        }
+
+        if ($unsupported !== []) {
+            throw QueryBuilderException::unsupportedInsertClauses($method, $unsupported);
+        }
+    }
+
+    /**
+     * Every configured clause other than table() and the WHERE predicates,
+     * named by the calls that set it.
+     *
+     * @return list<string>
+     */
+    private function clausesBeyondTableAndWhere(): array
+    {
+        return array_keys(array_filter([
+            'with()/withRecursive()' => $this->ctes !== [],
+            'a table() alias' => $this->tableAlias !== null,
+            'fromSub()' => $this->fromSub !== null,
+            'distinct()' => $this->distinct,
+            'select()/selectRaw()/selectSub()' => $this->selectColumns !== ['*'] || $this->selectExpressions !== [],
+            'join()/leftJoin()/joinOn()/joinSub()/crossJoin()' => $this->joins !== [],
+            'groupBy()/groupByRaw()' => $this->groups !== [],
+            'having()/orHaving()/havingRaw()' => !$this->havings->isEmpty(),
+            'union()/intersect()/except()' => $this->setOperations !== [],
+            'orderBy()/orderByRaw()' => $this->orders !== [],
+            'limit()' => $this->limitValue !== null,
+            'offset()' => $this->offsetValue !== null,
+            'lockForUpdate()/lockForShare()' => $this->lock !== null,
+        ]));
+    }
+
+    /**
+     * The admitted lock domain is a select from one table or inner joins,
+     * with predicates, ordering, limit and offset, kept narrow so every
+     * target locks the rows the query reads. PostgreSQL rejects a lock
+     * with DISTINCT, GROUP BY, HAVING, a set operation or the nullable
+     * side of an outer join; derived tables, CTEs and cross joins stay
+     * outside the domain as well.
+     */
+    private function assertLockIsPortable(): void
+    {
+        if ($this->lock === null) {
+            return;
+        }
+
+        $clauses = array_keys(array_filter([
+            'with()/withRecursive()' => $this->ctes !== [],
+            'fromSub()' => $this->fromSub !== null,
+            'distinct()' => $this->distinct,
+            'groupBy()/groupByRaw()' => $this->groups !== [],
+            'having()/orHaving()/havingRaw()' => !$this->havings->isEmpty(),
+            'union()/intersect()/except()' => $this->setOperations !== [],
+            'a LEFT or RIGHT join' => $this->hasJoin(static fn (array $join): bool => $join['type'] === 'LEFT' || $join['type'] === 'RIGHT'),
+            'crossJoin()' => $this->hasJoin(static fn (array $join): bool => $join['type'] === 'CROSS'),
+            'joinSub()' => $this->hasJoin(static fn (array $join): bool => $join['derived']),
+        ]));
+
+        if ($clauses !== []) {
+            throw QueryBuilderException::lockCannotCombine($clauses);
+        }
+    }
+
+    /**
+     * @param Closure(array{type: 'INNER'|'LEFT'|'RIGHT'|'CROSS', derived: bool, sql: string, params: list<mixed>}): bool $matches
+     */
+    private function hasJoin(Closure $matches): bool
+    {
+        foreach ($this->joins as $join) {
+            if ($matches($join)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function assertUnlocked(string $method): void
+    {
+        if ($this->lock !== null) {
+            throw QueryBuilderException::lockedTerminal($method);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    private static function readColumn(array $row, string $column, string $method): mixed
+    {
+        if (!array_key_exists($column, $row)) {
+            throw QueryBuilderException::columnMissingFromRow($method, $column);
+        }
+
+        return $row[$column];
+    }
+
+    private static function assertAllowedDirection(string $direction): string
+    {
+        $normalized = strtoupper(trim($direction));
+
+        if (!in_array($normalized, self::ALLOWED_ORDER_DIRECTIONS, true)) {
+            throw new InvalidArgumentException(
+                "Order direction \"{$direction}\" is not allowed. Use one of: " . implode(', ', self::ALLOWED_ORDER_DIRECTIONS) . '.',
+            );
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * @return 'INNER'|'LEFT'|'RIGHT'
+     */
+    private static function assertAllowedJoinType(string $type): string
+    {
+        $normalized = strtoupper(trim($type));
+
+        if (!in_array($normalized, self::ALLOWED_JOIN_TYPES, true)) {
+            throw new InvalidArgumentException(
+                "Join type \"{$type}\" is not allowed. Use one of: " . implode(', ', self::ALLOWED_JOIN_TYPES) . '.',
+            );
+        }
+
+        /** @var 'INNER'|'LEFT'|'RIGHT' $normalized */
+        return $normalized;
     }
 }

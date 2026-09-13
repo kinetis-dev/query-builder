@@ -22,10 +22,12 @@ Part of [Kinetis](https://kinetis.dev/), a non-blocking PHP framework for
 API-first applications, developed in the
 [kinetis-dev/kinetis](https://github.com/kinetis-dev/kinetis) monorepo.
 
-MySQL and Postgres through `kinetis/persistence`'s drivers, with
-row-to-DTO mapping via `Kinetis\Validation\Hydrator` — the same mechanism
-that hydrates a `#[Body]` request DTO. Not an ORM: no relationships, no
-migrations, no change-tracking, no `save()`-on-a-model.
+Parameterized selects, joins, subqueries, set operations, CTEs, row
+locks, inserts, upserts, updates and deletes over the SQL shared by
+MySQL 8.4, MariaDB 11.4 and PostgreSQL 16, run through
+`kinetis/persistence`'s drivers, with row-to-DTO mapping via
+`Kinetis\Validation\Hydrator`. Not an ORM: no relationships, no
+change-tracking, no `save()`-on-a-model.
 
 ```php
 use Kinetis\QueryBuilder\Query;
@@ -36,13 +38,11 @@ $orders = new Query($db)
     ->where('status', '!=', 'cancelled')
     ->orderBy('created_at', 'desc')
     ->limit(20)
-    ->get(OrderRow::class);
+    ->get(OrderRow::class); // OrderRow is your own row DTO
 ```
 
-`Query` works with either backend through the shared
-`Kinetis\Persistence\Contract\SqlLink` family both drivers implement,
-auto-detected from the concrete connection you pass in — and composes
-directly inside `Kinetis\Persistence\TransactionGuard::transaction()`.
+The connection's type selects the SQL dialect, and a `Query` built on a
+transaction runs inside it.
 
 ## Installation
 

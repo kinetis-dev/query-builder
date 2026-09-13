@@ -39,4 +39,28 @@ final class PostgresDialectTest extends TestCase
         self::assertSame('"orders"."total"', $dialect->quoteIdentifier('orders.total'));
         self::assertSame('"we""ird"', $dialect->quoteIdentifier('we"ird'));
     }
+
+    public function test_limit_offset_spells_a_bare_offset(): void
+    {
+        $dialect = new PostgresDialect();
+
+        self::assertSame('', $dialect->limitOffset(null, null));
+        self::assertSame(' LIMIT 5', $dialect->limitOffset(5, null));
+        self::assertSame(' LIMIT 5 OFFSET 10', $dialect->limitOffset(5, 10));
+        self::assertSame(' OFFSET 10', $dialect->limitOffset(null, 10));
+    }
+
+    public function test_postgres_specific_spellings(): void
+    {
+        $dialect = new PostgresDialect();
+
+        self::assertSame(' FOR SHARE', $dialect->sharedLock());
+        self::assertTrue($dialect->admitsLimitedInSubquery());
+        self::assertSame(' ON CONFLICT DO NOTHING', $dialect->insertOrIgnoreClause(['user_id']));
+        self::assertSame(
+            ' ON CONFLICT ("user_id", "article_id") DO UPDATE SET "views" = EXCLUDED."views"',
+            $dialect->upsertClause(['user_id', 'article_id'], ['views']),
+        );
+        self::assertSame(' RETURNING "id"', $dialect->insertGetIdClause('id'));
+    }
 }

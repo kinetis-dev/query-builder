@@ -7,31 +7,61 @@ namespace Kinetis\QueryBuilder;
 use Kinetis\Persistence\Contract\SqlResult;
 
 /**
- * The only two things MySQL and Postgres differ on for what this
- * package does — everything else (parameterized "?" placeholders, LIMIT n
- * OFFSET m, getRowCount()) is identical between them at the
- * Kinetis\Persistence\Contract\SqlLink level:
- *
- * 1. Identifier quoting (backtick vs double-quote).
- * 2. Getting a generated primary key back after an INSERT — MySQL reports
- *    it out-of-band (SqlResult::getLastInsertId()); Postgres has no
- *    equivalent, the idiomatic mechanism there is INSERT ... RETURNING
- *    plus reading the value back out of the result row.
+ * Every spelling Query needs that differs between the MySQL family
+ * (MySQL 8.4, MariaDB 11.4) and PostgreSQL 16. Everything else — "?"
+ * placeholders, joins, set operations, CTEs, exclusive lock clauses,
+ * affected-row counts — is written once in Query.
  */
 interface Dialect
 {
+    /**
+     * Quotes each "."-separated segment separately, so `orders.total`
+     * names the column total of orders rather than one column whose name
+     * contains a dot.
+     */
     public function quoteIdentifier(string $identifier): string;
 
     /**
-     * @param array<string, mixed> $data
-     * @return CompiledQuery an INSERT that also arranges to retrieve $primaryKey's generated value —
-     *         via a RETURNING clause on Postgres, unmodified on MySQL (see extractInsertedId()).
+     * The row-window suffix with its leading space, or '' for neither.
+     * Both values are non-negative ints validated before they get here.
      */
-    public function insertGetIdQuery(string $table, array $data, string $primaryKey): CompiledQuery;
+    public function limitOffset(?int $limit, ?int $offset): string;
+
+    /** The shared row-lock suffix, with its leading space. */
+    public function sharedLock(): string;
+
+    /** Whether an `IN (subquery)` may carry LIMIT or OFFSET. */
+    public function admitsLimitedInSubquery(): bool;
 
     /**
-     * Reads the value insertGetIdQuery() arranged to retrieve, from the SqlResult produced by
-     * actually executing it.
+     * The INSERT suffix that skips a row conflicting with a unique key
+     * while every other error still fails the statement.
+     *
+     * @param non-empty-list<string> $columns the inserted columns
+     */
+    public function insertOrIgnoreClause(array $columns): string;
+
+    /**
+     * The INSERT suffix that turns a unique-key conflict into an update of
+     * $update, each column taking the value the conflicting row tried to
+     * insert.
+     *
+     * @param non-empty-list<string> $uniqueBy
+     * @param non-empty-list<string> $update
+     */
+    public function upsertClause(array $uniqueBy, array $update): string;
+
+    /**
+     * The INSERT suffix that arranges for $primaryKey's generated value to
+     * be readable by extractInsertedId(): a RETURNING clause on
+     * PostgreSQL, nothing on the MySQL family, which reports it
+     * out-of-band.
+     */
+    public function insertGetIdClause(string $primaryKey): string;
+
+    /**
+     * Reads the value insertGetIdClause() arranged to retrieve, from the
+     * SqlResult produced by executing the INSERT.
      */
     public function extractInsertedId(SqlResult $result, string $primaryKey): int|string|null;
 
