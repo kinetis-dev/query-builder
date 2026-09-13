@@ -94,7 +94,8 @@ final class Query
     private array $selectColumns = ['*'];
 
     /**
-     * selectRaw() and selectSub() expressions, rendered, in call order.
+     * selectRaw(), selectSub() and selectExists() expressions, rendered, in
+     * call order.
      *
      * @var list<array{sql: string, params: list<mixed>}>
      */
@@ -146,12 +147,12 @@ final class Query
     private ?string $lock = null;
 
     /**
-     * Set by selectRaw()/groupByRaw()/orderByRaw() and by attaching raw
-     * SQL through a join, subquery, CTE or set operand; the predicate
-     * clauses track their own. See run() for why this disables
-     * literal-inlining for the whole query.
+     * Set by selectRaw()/groupByRaw()/orderByRaw() text containing a "?",
+     * and by attaching a join, subquery, CTE or set operand whose raw SQL
+     * does; the predicate clauses track their own. See run() for why this
+     * disables literal-inlining for the whole query.
      */
-    private bool $hasRawFragment = false;
+    private bool $hasRawQuestionMark = false;
 
     /**
      * The link's own type is the only dialect authority. MysqlLink|
@@ -189,19 +190,21 @@ final class Query
      *
      * Every "?" this class emits itself has exactly one binding pushed at
      * the same time, which is what makes a positional substitution safe.
-     * Raw SQL text breaks that: it may contain a "?" that was never a
-     * placeholder, so $hasRawFragment sends the whole statement to
+     * A "?" in raw SQL text breaks that: it may never have been a
+     * placeholder, so $hasRawQuestionMark sends the whole statement to
      * execute() rather than telling a real placeholder from a decoy one.
+     * Raw text without a "?" cannot shift a substitution, so it leaves
+     * inlining alone.
      *
      * @param list<mixed> $params
      */
-    private function run(string $sql, array $params, bool $hasRawFragment): SqlResult
+    private function run(string $sql, array $params, bool $hasRawQuestionMark): SqlResult
     {
         if ($params === []) {
             return $this->link->query($sql);
         }
 
-        $inlined = $hasRawFragment ? null : $this->inlineLiterals($sql, $params);
+        $inlined = $hasRawQuestionMark ? null : $this->inlineLiterals($sql, $params);
 
         return $inlined !== null ? $this->link->query($inlined) : $this->link->execute($sql, $params);
     }
@@ -247,9 +250,9 @@ final class Query
         return $result;
     }
 
-    private function containsRawSql(): bool
+    private function containsRawQuestionMark(): bool
     {
-        return $this->hasRawFragment || $this->wheres->hasRawFragment() || $this->havings->hasRawFragment();
+        return $this->hasRawQuestionMark || $this->wheres->hasRawQuestionMark() || $this->havings->hasRawQuestionMark();
     }
 
     /**
@@ -317,7 +320,7 @@ final class Query
     public function selectRaw(string $sql, array $params = []): static
     {
         $this->selectExpressions[] = ['sql' => $sql, 'params' => $params];
-        $this->hasRawFragment = true;
+        $this->hasRawQuestionMark = $this->hasRawQuestionMark || str_contains($sql, '?');
 
         return $this;
     }
@@ -328,6 +331,22 @@ final class Query
         $snapshot = $this->attach($query, 'selectSub()');
         $this->selectExpressions[] = [
             'sql' => "({$snapshot->sql}) AS " . $this->dialect->quoteIdentifier($as),
+            'params' => $snapshot->params,
+        ];
+
+        return $this;
+    }
+
+    /**
+     * Selects as $as whether $query returns a row: 1 when it does and 0
+     * when it does not, on every target. $query may correlate with this
+     * query's tables, as with selectSub().
+     */
+    public function selectExists(Query $query, string $as): static
+    {
+        $snapshot = $this->attach($query, 'selectExists()');
+        $this->selectExpressions[] = [
+            'sql' => "CASE WHEN EXISTS ({$snapshot->sql}) THEN 1 ELSE 0 END AS " . $this->dialect->quoteIdentifier($as),
             'params' => $snapshot->params,
         ];
 
@@ -567,7 +586,7 @@ final class Query
     public function groupByRaw(string $sql, array $params = []): static
     {
         $this->groups[] = ['sql' => $sql, 'params' => $params];
-        $this->hasRawFragment = true;
+        $this->hasRawQuestionMark = $this->hasRawQuestionMark || str_contains($sql, '?');
 
         return $this;
     }
@@ -623,7 +642,7 @@ final class Query
     public function orderByRaw(string $sql, array $params = []): static
     {
         $this->orders[] = ['sql' => $sql, 'params' => $params];
-        $this->hasRawFragment = true;
+        $this->hasRawQuestionMark = $this->hasRawQuestionMark || str_contains($sql, '?');
 
         return $this;
     }
@@ -712,7 +731,7 @@ final class Query
         }
 
         $compiled = $this->toSelectSql();
-        $result = $this->run($compiled->sql, $compiled->params, $this->containsRawSql());
+        $result = $this->run($compiled->sql, $compiled->params, $this->containsRawQuestionMark());
 
         $rows = [];
 
@@ -775,7 +794,7 @@ final class Query
         $result = $this->run(
             $with->sql . "SELECT CASE WHEN EXISTS ({$query->sql}) THEN 1 ELSE 0 END AS aggregate",
             [...$with->params, ...$query->params],
-            $this->containsRawSql(),
+            $this->containsRawQuestionMark(),
         );
 
         return (int) ($result->fetchRow()['aggregate'] ?? 0) === 1;
@@ -932,7 +951,7 @@ final class Query
 
         $cursorRowKey = $cursorAlias ?? $cursorColumn;
         $compiled = $page->orderBy($cursorColumn)->limit($perPage + 1)->toSelectSql();
-        $result = $page->run($compiled->sql, $compiled->params, $page->containsRawSql());
+        $result = $page->run($compiled->sql, $compiled->params, $page->containsRawQuestionMark());
 
         /** @var list<array<string, mixed>> $rows */
         $rows = [];
@@ -1129,7 +1148,7 @@ final class Query
         $sql = 'INSERT INTO ' . $this->dialect->quoteIdentifier($this->table)
             . ' (' . implode(', ', array_map($this->dialect->quoteIdentifier(...), $columns)) . ') ' . $source->sql;
 
-        return $this->run($sql, $source->params, $select->containsRawSql())->getRowCount() ?? 0;
+        return $this->run($sql, $source->params, $select->containsRawQuestionMark())->getRowCount() ?? 0;
     }
 
     /**
@@ -1194,7 +1213,7 @@ final class Query
     {
         $compiled = $this->toUpdateSql($values);
 
-        return $this->run($compiled->sql, $compiled->params, $this->containsRawSql())->getRowCount() ?? 0;
+        return $this->run($compiled->sql, $compiled->params, $this->containsRawQuestionMark())->getRowCount() ?? 0;
     }
 
     /**
@@ -1220,7 +1239,7 @@ final class Query
     {
         $compiled = $this->toDeleteSql();
 
-        return $this->run($compiled->sql, $compiled->params, $this->containsRawSql())->getRowCount() ?? 0;
+        return $this->run($compiled->sql, $compiled->params, $this->containsRawQuestionMark())->getRowCount() ?? 0;
     }
 
     public function toSelectSql(): CompiledQuery
@@ -1278,7 +1297,7 @@ final class Query
         $quoted = $this->dialect->quoteIdentifier($column);
         $compiled = $this->compileUpdate(["{$quoted} = {$quoted} {$operator} ?"], [$amount], $extra);
 
-        return $this->run($compiled->sql, $compiled->params, $this->containsRawSql())->getRowCount() ?? 0;
+        return $this->run($compiled->sql, $compiled->params, $this->containsRawQuestionMark())->getRowCount() ?? 0;
     }
 
     /**
@@ -1403,13 +1422,13 @@ final class Query
 
         $compiled = $this->compileQueryExpression(true);
 
-        return new Snapshot($compiled->sql, $compiled->params, $this->containsRawSql(), $this->isLimited());
+        return new Snapshot($compiled->sql, $compiled->params, $this->containsRawQuestionMark(), $this->isLimited());
     }
 
     private function attach(Query $query, string $method): Snapshot
     {
         $snapshot = ($this->capture)($query, $method);
-        $this->hasRawFragment = $this->hasRawFragment || $snapshot->hasRawFragment;
+        $this->hasRawQuestionMark = $this->hasRawQuestionMark || $snapshot->hasRawQuestionMark;
 
         return $snapshot;
     }
@@ -1469,7 +1488,7 @@ final class Query
             'sql' => " {$type} JOIN {$source} ON {$compiled->sql}",
             'params' => [...$params, ...$compiled->params],
         ];
-        $this->hasRawFragment = $this->hasRawFragment || $conditions->hasRawFragment();
+        $this->hasRawQuestionMark = $this->hasRawQuestionMark || $conditions->hasRawQuestionMark();
 
         return $this;
     }
@@ -1498,7 +1517,7 @@ final class Query
         $this->assertUnlocked($method);
 
         $compiled = $this->compileAggregate($expression);
-        $row = $this->run($compiled->sql, $compiled->params, $this->containsRawSql())->fetchRow();
+        $row = $this->run($compiled->sql, $compiled->params, $this->containsRawQuestionMark())->fetchRow();
 
         /** @var int|float|string|null $value an aggregate column is a scalar or NULL in every driver's row */
         $value = $row['aggregate'] ?? null;
@@ -1631,11 +1650,11 @@ final class Query
 
     /**
      * The default "*" is dropped once anything explicit — select(),
-     * selectRaw() or selectSub() — has been specified: a caller reaching
-     * only for selectRaw('COUNT(*) AS total') wants exactly that, not also
-     * every column. Once select() has been called $selectColumns is no
-     * longer literally ['*'], so the explicit columns and the expressions
-     * combine normally.
+     * selectRaw(), selectSub() or selectExists() — has been specified: a
+     * caller reaching only for selectRaw('COUNT(*) AS total') wants exactly
+     * that, not also every column. Once select() has been called
+     * $selectColumns is no longer literally ['*'], so the explicit columns
+     * and the expressions combine normally.
      */
     private function compileSelectColumns(): CompiledQuery
     {
@@ -1749,7 +1768,7 @@ final class Query
             'a table() alias' => $this->tableAlias !== null,
             'fromSub()' => $this->fromSub !== null,
             'distinct()' => $this->distinct,
-            'select()/selectRaw()/selectSub()' => $this->selectColumns !== ['*'] || $this->selectExpressions !== [],
+            'select()/selectRaw()/selectSub()/selectExists()' => $this->selectColumns !== ['*'] || $this->selectExpressions !== [],
             'join()/leftJoin()/joinOn()/joinSub()/crossJoin()' => $this->joins !== [],
             'groupBy()/groupByRaw()' => $this->groups !== [],
             'having()/orHaving()/havingRaw()' => !$this->havings->isEmpty(),

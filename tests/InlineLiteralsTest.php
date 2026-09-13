@@ -4,11 +4,15 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder\Tests;
 
+use Closure;
+use Kinetis\QueryBuilder\Conditions;
 use Kinetis\QueryBuilder\Query;
+use Kinetis\QueryBuilder\Tests\Fixtures\FakeMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\PreparingSpyMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\PreparingSpyPostgresLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\SpyMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\SpyPostgresLink;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -87,7 +91,7 @@ final class InlineLiteralsTest extends TestCase
         self::assertSame('execute', $spy->calls[0]->method);
     }
 
-    public function test_where_raw_disables_inlining_for_the_whole_query_even_with_only_int_params(): void
+    public function test_where_raw_with_a_placeholder_disables_inlining_even_with_only_int_params(): void
     {
         $spy = new SpyMysqlLink();
         new Query($spy)->table('items')->where('id', '=', 1)->whereRaw('extra = ?', [2])->get();
@@ -95,20 +99,86 @@ final class InlineLiteralsTest extends TestCase
         self::assertSame('execute', $spy->calls[0]->method);
     }
 
-    public function test_select_raw_disables_inlining_even_for_an_otherwise_all_int_query(): void
+    public function test_raw_fragments_without_a_question_mark_keep_an_all_int_query_inlined(): void
     {
         $spy = new SpyMysqlLink();
-        new Query($spy)->table('items')->selectRaw('COUNT(*) as c')->where('id', '=', 1)->get();
+        new Query($spy)->table('items')->selectRaw('COUNT(*) AS c')->where('id', '=', 1)->orderByRaw('RAND()')->get();
 
-        self::assertSame('execute', $spy->calls[0]->method);
+        self::assertSame('query', $spy->calls[0]->method);
+        self::assertSame('SELECT COUNT(*) AS c FROM `items` WHERE `id` = 1 ORDER BY RAND()', $spy->calls[0]->sql);
     }
 
-    public function test_order_by_raw_disables_inlining_even_for_an_otherwise_all_int_query(): void
+    /**
+     * The "?" here was never a placeholder, yet the number of "?" matches
+     * the number of values: substituting by position would write 3 into
+     * the string literal. Binding leaves the mismatch to the driver.
+     */
+    public function test_a_question_mark_inside_raw_sql_text_still_binds(): void
     {
         $spy = new SpyMysqlLink();
-        new Query($spy)->table('items')->orderByRaw('RAND()')->where('id', '=', 1)->get();
+        new Query($spy)->table('items')->whereRaw("note <> 'why?'", [3])->get();
 
         self::assertSame('execute', $spy->calls[0]->method);
+        self::assertSame("SELECT * FROM `items` WHERE note <> 'why?'", $spy->calls[0]->sql);
+        self::assertSame([3], $spy->calls[0]->params);
+    }
+
+    /**
+     * Each raw entry point, and each way raw text reaches a query from
+     * another builder, decides the same way: a fragment without "?"
+     * keeps the literals inlined, and one with a "?" binds the whole
+     * statement even when every value could have been inlined.
+     *
+     * @param Closure(Query, string, list<mixed>): Query $attach
+     */
+    #[DataProvider('rawFragmentPositions')]
+    public function test_every_raw_position_disables_inlining_only_for_a_question_mark(Closure $attach): void
+    {
+        $plain = new SpyMysqlLink();
+        $attach(new Query($plain)->table('items')->where('id', '=', 7), 'LENGTH(title) > 0', [])->get();
+
+        self::assertSame('query', $plain->calls[0]->method);
+        self::assertStringContainsString('`id` = 7', $plain->calls[0]->sql);
+        self::assertStringNotContainsString('?', $plain->calls[0]->sql);
+
+        $marked = new SpyMysqlLink();
+        $attach(new Query($marked)->table('items')->where('id', '=', 7), 'LENGTH(title) > ?', [3])->get();
+
+        self::assertSame('execute', $marked->calls[0]->method);
+        self::assertEqualsCanonicalizing([3, 7], $marked->calls[0]->params);
+    }
+
+    /** @return iterable<string, array{Closure(Query, string, list<mixed>): Query}> */
+    public static function rawFragmentPositions(): iterable
+    {
+        $tags = static fn (): Query => new Query(new FakeMysqlLink())->table('tags');
+
+        yield 'selectRaw()' => [static fn (Query $q, string $raw, array $params) => $q->selectRaw($raw, $params)];
+        yield 'whereRaw()' => [static fn (Query $q, string $raw, array $params) => $q->whereRaw($raw, $params)];
+        yield 'groupByRaw()' => [static fn (Query $q, string $raw, array $params) => $q->groupByRaw($raw, $params)];
+        yield 'havingRaw()' => [static fn (Query $q, string $raw, array $params) => $q->havingRaw($raw, $params)];
+        yield 'orderByRaw()' => [static fn (Query $q, string $raw, array $params) => $q->orderByRaw($raw, $params)];
+        yield 'a whereGroup() predicate' => [
+            static fn (Query $q, string $raw, array $params) => $q->whereGroup(static fn (Conditions $g) => $g->whereRaw($raw, $params)),
+        ];
+        yield 'a whereExists() subquery' => [
+            static fn (Query $q, string $raw, array $params) => $q->whereExists($tags()->whereRaw($raw, $params)),
+        ];
+        yield 'a selectSub() subquery' => [
+            static fn (Query $q, string $raw, array $params) => $q->selectSub($tags()->selectRaw($raw, $params), 'x'),
+        ];
+        yield 'a selectExists() subquery' => [
+            static fn (Query $q, string $raw, array $params) => $q->selectExists($tags()->whereRaw($raw, $params), 'x'),
+        ];
+        yield 'a CTE' => [
+            static fn (Query $q, string $raw, array $params) => $q->with('recent', $tags()->whereRaw($raw, $params)),
+        ];
+        yield 'a join ON clause' => [
+            static fn (Query $q, string $raw, array $params) => $q->joinOn('tags', static fn (Conditions $on) => $on->whereRaw($raw, $params)),
+        ];
+        yield 'a set operand' => [
+            static fn (Query $q, string $raw, array $params) => $q->union($tags()->whereRaw($raw, $params)),
+        ];
     }
 
     public function test_where_in_is_eligible_for_inlining_like_a_plain_where(): void
@@ -210,6 +280,16 @@ final class InlineLiteralsTest extends TestCase
         self::assertCount(1, $spy->calls);
         self::assertSame('execute', $spy->calls[0]->method);
         self::assertSame('SELECT * FROM `items` WHERE `id` = ?', $spy->calls[0]->sql);
+        self::assertSame([42], $spy->calls[0]->params);
+    }
+
+    public function test_such_a_driver_binds_alongside_a_raw_fragment_without_a_question_mark(): void
+    {
+        $spy = new PreparingSpyMysqlLink();
+        new Query($spy)->table('items')->selectRaw('COUNT(*) AS c')->where('id', '=', 42)->get();
+
+        self::assertSame('execute', $spy->calls[0]->method);
+        self::assertSame('SELECT COUNT(*) AS c FROM `items` WHERE `id` = ?', $spy->calls[0]->sql);
         self::assertSame([42], $spy->calls[0]->params);
     }
 

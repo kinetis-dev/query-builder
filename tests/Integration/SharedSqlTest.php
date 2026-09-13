@@ -14,6 +14,7 @@ use Kinetis\QueryBuilder\Exception\QueryBuilderException;
 use Kinetis\QueryBuilder\LockWait;
 use Kinetis\QueryBuilder\Query;
 use Kinetis\QueryBuilder\RowValues;
+use Kinetis\QueryBuilder\Tests\Fixtures\ArticleFlagRow;
 use Kinetis\QueryBuilder\Tests\Fixtures\ArticleRow;
 use Kinetis\QueryBuilder\Tests\Fixtures\ArticleStatus;
 use Kinetis\QueryBuilder\Tests\Fixtures\ArticleWrite;
@@ -399,5 +400,37 @@ final class SharedSqlTest extends TestCase
         self::assertSame(5, (int) $articles()->sum('views'));
         self::assertSame(1, $articles()->whereNotIn('id', new Query($link)->table('kin_qb_favorites')->select('article_id'))->delete());
         self::assertSame(['a1', 'a3'], $articles()->orderBy('id')->pluck('slug'));
+    }
+
+    /** selectExists() reads back as the integers 1 and 0, and a DTO's bool hydrates from them. */
+    #[DataProvider('backends')]
+    public function test_select_exists_reads_back_one_or_zero_and_hydrates_into_bool(string $backend): void
+    {
+        $link = $this->link($backend);
+        self::createArticles($link, $backend);
+        self::recreate($link, 'kin_qb_favorites', 'user_id INT NOT NULL, article_id INT NOT NULL, PRIMARY KEY (user_id, article_id)');
+
+        new Query($link)->table('kin_qb_articles')->insert([
+            ['title' => 'One', 'status' => 'published', 'slug' => 'a1'],
+            ['title' => 'Two', 'status' => 'published', 'slug' => 'a2'],
+        ]);
+        $favoriteId = new Query($link)->table('kin_qb_articles')->where('slug', '=', 'a1')->value('id');
+        new Query($link)->table('kin_qb_favorites')->insert(['user_id' => 10, 'article_id' => (int) $favoriteId]);
+
+        $articles = static fn (): Query => new Query($link)->table('kin_qb_articles')
+            ->select('slug')
+            ->selectExists(
+                new Query($link)->table('kin_qb_favorites')
+                    ->whereColumn('kin_qb_favorites.article_id', '=', 'kin_qb_articles.id')
+                    ->where('kin_qb_favorites.user_id', '=', 10),
+                'favorited',
+            )
+            ->orderBy('slug');
+
+        self::assertSame([['slug' => 'a1', 'favorited' => 1], ['slug' => 'a2', 'favorited' => 0]], $articles()->get());
+        self::assertEquals(
+            [new ArticleFlagRow('a1', true), new ArticleFlagRow('a2', false)],
+            $articles()->get(ArticleFlagRow::class),
+        );
     }
 }

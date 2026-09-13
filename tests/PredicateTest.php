@@ -374,6 +374,7 @@ final class PredicateTest extends TestCase
             static fn (Query $parent, Query $sub) => $parent->whereGroup(static fn (Conditions $g) => $g->whereExists($sub)),
         ];
         yield 'selectSub()' => [static fn (Query $parent, Query $sub) => $parent->selectSub($sub->limit(1), 'favorite')];
+        yield 'selectExists()' => [static fn (Query $parent, Query $sub) => $parent->selectExists($sub, 'favorited')];
         yield 'fromSub()' => [static fn (Query $parent, Query $sub) => $parent->fromSub($sub, 'f')];
         yield 'joinSub()' => [
             static fn (Query $parent, Query $sub) => $parent->joinSub($sub, 'f', static fn (Conditions $on) => $on->whereColumn('f.article_id', '=', 'articles.id')),
@@ -410,6 +411,7 @@ final class PredicateTest extends TestCase
         yield 'whereExists()' => [static fn (Query $p, Query $s) => $p->whereExists($s), 'whereExists()'];
         yield 'orWhereNotExists()' => [static fn (Query $p, Query $s) => $p->orWhereNotExists($s), 'orWhereNotExists()'];
         yield 'selectSub()' => [static fn (Query $p, Query $s) => $p->selectSub($s, 'x'), 'selectSub()'];
+        yield 'selectExists()' => [static fn (Query $p, Query $s) => $p->selectExists($s, 'x'), 'selectExists()'];
         yield 'fromSub()' => [static fn (Query $p, Query $s) => $p->fromSub($s, 'x'), 'fromSub()'];
         yield 'joinSub()' => [
             static fn (Query $p, Query $s) => $p->joinSub($s, 'x', static fn (Conditions $on) => $on->whereColumn('a', '=', 'b')),
@@ -447,5 +449,31 @@ final class PredicateTest extends TestCase
         );
 
         new Query(new SpyMysqlTransaction())->table('comments')->whereExists($locked);
+    }
+
+    public function test_select_exists_refuses_a_cte_and_a_lock_like_every_other_subquery(): void
+    {
+        $withCte = self::mysql()->with('recent', self::mysql()->table('articles'))->table('recent')->select('id');
+
+        try {
+            self::mysql()->table('comments')->selectExists($withCte, 'recent');
+            self::fail('selectExists() was expected to refuse a Query carrying a CTE.');
+        } catch (QueryBuilderException $e) {
+            self::assertSame(
+                'selectExists() cannot embed a Query carrying with()/withRecursive(). Register common table expressions '
+                . 'on the outermost query and refer to them by name.',
+                $e->getMessage(),
+            );
+        }
+
+        $locked = new Query(new SpyMysqlTransaction())->table('articles')->select('id')->lockForUpdate();
+
+        $this->expectException(QueryBuilderException::class);
+        $this->expectExceptionMessage(
+            'selectExists() cannot embed a Query carrying lockForUpdate()/lockForShare(). A row lock belongs to the '
+            . 'outermost select.',
+        );
+
+        new Query(new SpyMysqlTransaction())->table('comments')->selectExists($locked, 'locked');
     }
 }

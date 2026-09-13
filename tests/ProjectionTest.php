@@ -72,6 +72,44 @@ final class ProjectionTest extends TestCase
         self::assertSame([4, 'published'], $compiled->params);
     }
 
+    public function test_select_exists_projects_an_integer_flag_under_its_alias_in_binding_order(): void
+    {
+        $favorited = self::mysql()->table('favorites')
+            ->whereColumn('favorites.article_id', '=', 'articles.id')
+            ->where('favorites.user_id', '=', 4);
+
+        $compiled = self::mysql()->table('articles')
+            ->select('articles.id')
+            ->selectRaw('? AS one', [1])
+            ->selectExists($favorited, 'favorited')
+            ->where('articles.status', '=', 'published')
+            ->toSelectSql();
+
+        self::assertSame(
+            'SELECT `articles`.`id`, ? AS one, CASE WHEN EXISTS (SELECT * FROM `favorites` WHERE `favorites`.`article_id` = '
+            . '`articles`.`id` AND `favorites`.`user_id` = ?) THEN 1 ELSE 0 END AS `favorited` FROM `articles` WHERE '
+            . '`articles`.`status` = ?',
+            $compiled->sql,
+        );
+        self::assertSame([1, 4, 'published'], $compiled->params);
+
+        $following = new Query(new FakePostgresLink())->table('follows')
+            ->whereColumn('follows.followed_id', '=', 'users.id')
+            ->where('follows.follower_id', '=', 9);
+
+        $compiled = new Query(new FakePostgresLink())->table('users')
+            ->select('users.id')
+            ->selectExists($following, 'following')
+            ->toSelectSql();
+
+        self::assertSame(
+            'SELECT "users"."id", CASE WHEN EXISTS (SELECT * FROM "follows" WHERE "follows"."followed_id" = "users"."id" '
+            . 'AND "follows"."follower_id" = ?) THEN 1 ELSE 0 END AS "following" FROM "users"',
+            $compiled->sql,
+        );
+        self::assertSame([9], $compiled->params);
+    }
+
     public function test_distinct_group_by_and_structured_having(): void
     {
         $compiled = new Query(new FakePostgresLink())->table('articles')

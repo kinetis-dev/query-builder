@@ -344,7 +344,7 @@ final class QueryTest extends TestCase
     {
         $other = static fn (): Query => new Query(new SpyMysqlLink())->table('orders')->select('user_id');
         $joins = 'join()/leftJoin()/joinOn()/joinSub()/crossJoin()';
-        $projection = 'select()/selectRaw()/selectSub()';
+        $projection = 'select()/selectRaw()/selectSub()/selectExists()';
 
         yield 'with()' => [static fn (Query $q) => $q->with('recent', $other()), 'with()/withRecursive()'];
         yield 'a table alias' => [static fn (Query $q) => $q->table('users', as: 'u'), 'a table() alias'];
@@ -353,6 +353,7 @@ final class QueryTest extends TestCase
         yield 'select()' => [static fn (Query $q) => $q->select('id'), $projection];
         yield 'selectRaw()' => [static fn (Query $q) => $q->selectRaw('COUNT(*) AS total'), $projection];
         yield 'selectSub()' => [static fn (Query $q) => $q->selectSub($other()->limit(1), 'last_order'), $projection];
+        yield 'selectExists()' => [static fn (Query $q) => $q->selectExists($other(), 'has_orders'), $projection];
         yield 'join()' => [static fn (Query $q) => $q->join('orders', 'users.id', '=', 'orders.user_id'), $joins];
         yield 'leftJoin()' => [static fn (Query $q) => $q->leftJoin('orders', 'users.id', '=', 'orders.user_id'), $joins];
         yield 'crossJoin()' => [static fn (Query $q) => $q->crossJoin('orders'), $joins];
@@ -461,8 +462,7 @@ final class QueryTest extends TestCase
             ->whereRaw('name IS NOT NULL')
             ->delete();
 
-        self::assertSame('DELETE FROM `users` WHERE `id` = ? AND name IS NOT NULL', $spy->calls[0]->sql);
-        self::assertSame([5], $spy->calls[0]->params);
+        self::assertSame('DELETE FROM `users` WHERE `id` = 5 AND name IS NOT NULL', $spy->calls[0]->sql);
         self::assertSame(0, $deleted);
     }
 

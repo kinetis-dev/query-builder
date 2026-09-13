@@ -36,7 +36,7 @@ final class Conditions
     /** @var list<array{boolean: 'AND'|'OR', sql: string, params: list<mixed>}> */
     private array $predicates = [];
 
-    private bool $hasRawFragment = false;
+    private bool $hasRawQuestionMark = false;
 
     /**
      * @internal Query creates every instance.
@@ -180,7 +180,7 @@ final class Conditions
             );
         }
 
-        $this->hasRawFragment = true;
+        $this->hasRawQuestionMark = $this->hasRawQuestionMark || str_contains($sql, '?');
 
         return $this->add($normalizedBoolean, $sql, $params);
     }
@@ -231,14 +231,14 @@ final class Conditions
     }
 
     /**
-     * Whether any predicate carries caller-written SQL text, directly or
-     * inside a group or subquery.
+     * Whether any predicate carries caller-written SQL text containing a
+     * "?", directly or inside a group or subquery.
      *
      * @internal
      */
-    public function hasRawFragment(): bool
+    public function hasRawQuestionMark(): bool
     {
-        return $this->hasRawFragment;
+        return $this->hasRawQuestionMark;
     }
 
     /**
@@ -342,7 +342,7 @@ final class Conditions
         }
 
         $compiled = $conditions->compile();
-        $this->hasRawFragment = $this->hasRawFragment || $conditions->hasRawFragment;
+        $this->hasRawQuestionMark = $this->hasRawQuestionMark || $conditions->hasRawQuestionMark;
 
         return $this->add($boolean, "({$compiled->sql})", $compiled->params);
     }
@@ -350,7 +350,7 @@ final class Conditions
     private function snapshotOf(Query $query, string $method): Snapshot
     {
         $snapshot = ($this->capture)($query, $method);
-        $this->hasRawFragment = $this->hasRawFragment || $snapshot->hasRawFragment;
+        $this->hasRawQuestionMark = $this->hasRawQuestionMark || $snapshot->hasRawQuestionMark;
 
         return $snapshot;
     }

@@ -23,7 +23,7 @@ final readonly class Snapshot
     public function __construct(
         public string $sql,
         public array $params,
-        public bool $hasRawFragment,
+        public bool $hasRawQuestionMark,
         public bool $isLimited,
     ) {}
 }
