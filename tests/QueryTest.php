@@ -11,11 +11,15 @@ use Kinetis\QueryBuilder\Exception\QueryBuilderException;
 use Kinetis\QueryBuilder\Query;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakeMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakePostgresLink;
+use Kinetis\QueryBuilder\Tests\Fixtures\PortableTransactionCallback;
 use Kinetis\QueryBuilder\Tests\Fixtures\PreparingSpyMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\QueuedRowsMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\QueuedSqlResult;
 use Kinetis\QueryBuilder\Tests\Fixtures\SpyMysqlLink;
+use Kinetis\QueryBuilder\Tests\Fixtures\SpyMysqlTransaction;
 use Kinetis\QueryBuilder\Tests\Fixtures\SpyPostgresLink;
+use Kinetis\QueryBuilder\Tests\Fixtures\SpyPostgresTransaction;
+use Kinetis\QueryBuilder\Tests\Fixtures\UnmarkedSqlTransaction;
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -37,6 +41,29 @@ final class QueryTest extends TestCase
     {
         self::assertSame('SELECT * FROM `users`', $this->mysql()->table('users')->toSelectSql()->sql);
         self::assertSame('SELECT * FROM "users"', $this->postgres()->table('users')->toSelectSql()->sql);
+    }
+
+    public function test_a_transaction_passed_as_the_shared_contract_keeps_its_dialect_marker(): void
+    {
+        $mysql = new SpyMysqlTransaction();
+        $postgres = new SpyPostgresTransaction();
+
+        PortableTransactionCallback::query($mysql)->table('users')->get();
+        PortableTransactionCallback::query($postgres)->table('users')->get();
+
+        self::assertSame('SELECT * FROM `users`', $mysql->calls[0]->sql);
+        self::assertSame('SELECT * FROM "users"', $postgres->calls[0]->sql);
+    }
+
+    public function test_a_transaction_without_a_dialect_marker_is_refused_at_construction(): void
+    {
+        $this->expectException(QueryBuilderException::class);
+        $this->expectExceptionMessage(
+            'new Query() was given ' . UnmarkedSqlTransaction::class . ', a SqlTransaction carrying neither the '
+            . 'MysqlLink nor the PostgresLink marker, so it names no SQL dialect to compile for.',
+        );
+
+        PortableTransactionCallback::query(new UnmarkedSqlTransaction());
     }
 
     public function test_select_with_specific_columns_quotes_each_one(): void

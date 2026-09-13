@@ -12,6 +12,14 @@ use RuntimeException;
  */
 final class QueryBuilderException extends RuntimeException
 {
+    public static function linkWithoutDialect(string $class): self
+    {
+        return new self(
+            "new Query() was given {$class}, a SqlTransaction carrying neither the MysqlLink nor the PostgresLink "
+            . 'marker, so it names no SQL dialect to compile for. Implement MysqlTransaction or PostgresTransaction.',
+        );
+    }
+
     /**
      * update(), increment(), decrement() and delete() compile the table
      * and the WHERE clause only. $clauses names the state the caller

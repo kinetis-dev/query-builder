@@ -16,6 +16,7 @@
 >
     <projectFiles>
         <directory name="src" />
+        <file name="tests/Fixtures/PortableTransactionCallback.php" />
         <ignoreFiles>
             <directory name="vendor" />
         </ignoreFiles>

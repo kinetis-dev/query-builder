@@ -155,14 +155,19 @@ final class Query
     private bool $hasRawQuestionMark = false;
 
     /**
-     * The link's own type is the only dialect authority. MysqlLink|
-     * PostgresLink is a closed union, so PHP's argument-type enforcement
-     * rejects anything else at the call site and there is no "neither"
-     * branch to write here.
+     * The link's MysqlLink or PostgresLink marker is the only dialect
+     * authority. SqlTransaction is admitted so a transaction callback
+     * typed against the shared contract composes; every Kinetis
+     * transaction carries its link's marker, and one carrying neither is
+     * refused here rather than compiled for a guessed dialect.
      */
-    public function __construct(private readonly MysqlLink|PostgresLink $link)
+    public function __construct(private readonly MysqlLink|PostgresLink|SqlTransaction $link)
     {
-        $dialect = $link instanceof MysqlLink ? new MySqlDialect() : new PostgresDialect();
+        $dialect = match (true) {
+            $link instanceof MysqlLink => new MySqlDialect(),
+            $link instanceof PostgresLink => new PostgresDialect(),
+            default => throw QueryBuilderException::linkWithoutDialect($link::class),
+        };
         $this->dialect = $dialect;
         // Static, so it keeps no reference to this instance; declared in
         // this class, so it may compile another Query's private state.
