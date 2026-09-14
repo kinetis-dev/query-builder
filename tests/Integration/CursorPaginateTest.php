@@ -4,11 +4,11 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder\Tests\Integration;
 
-use Kinetis\Http\Pagination\CursorPaginator;
 use Kinetis\Persistence\Contract\MysqlLink;
 use Kinetis\Persistence\Contract\PostgresLink;
 use Kinetis\Persistence\Driver\MysqliAsyncClient;
 use Kinetis\Persistence\Driver\PgsqlAsyncClient;
+use Kinetis\QueryBuilder\CursorPaginator;
 use Kinetis\QueryBuilder\Query;
 use Kinetis\QueryBuilder\Tests\Fixtures\CursorReviewItem;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -117,9 +117,9 @@ final class CursorPaginateTest extends TestCase
         $link->close();
     }
 
-    /** The alias never reaches hydration, so the DTO sees only the caller's own columns. */
+    /** The alias never reaches mapping, so the DTO sees only the caller's own columns. */
     #[DataProvider('backends')]
-    public function test_dto_hydration_never_sees_the_cursor_alias(string $backend): void
+    public function test_dto_mapping_never_sees_the_cursor_alias(string $backend): void
     {
         $link = self::makeLink($backend);
         self::seed($link, $backend, 'kin_cursor_dto');

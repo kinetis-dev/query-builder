@@ -4,12 +4,10 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder\Tests\Fixtures;
 
-use Kinetis\Validation\Absent;
-
 /**
  * A write DTO carrying every property shape RowValues distinguishes:
- * promoted readonly, asymmetric visibility, Absent, null, a backed enum,
- * a never-initialized typed property, and protected/private state.
+ * promoted readonly, asymmetric visibility, null, a backed enum, a
+ * never-initialized typed property, and protected/private state.
  */
 final class ArticleWrite
 {
@@ -24,7 +22,7 @@ final class ArticleWrite
     public function __construct(
         public readonly string $title,
         public readonly ArticleStatus $status,
-        public readonly string|null|Absent $summary = Absent::Value,
+        public readonly ?string $summary = null,
         public readonly ?int $authorId = null,
         string $slug = 'hello-world',
     ) {

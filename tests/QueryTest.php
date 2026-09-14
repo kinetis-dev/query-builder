@@ -724,21 +724,6 @@ final class QueryTest extends TestCase
         $this->mysql()->table('users')->paginate(0);
     }
 
-    /**
-     * A 400, not the generic 500 an uncaught InvalidArgumentException
-     * would otherwise reach ExceptionHandlerMiddleware as — see
-     * Kinetis\Http\Exception\HttpStatusExceptionInterface.
-     */
-    public function test_invalid_pagination_exception_declares_a_400_status(): void
-    {
-        try {
-            $this->mysql()->table('users')->paginate(0);
-            self::fail('paginate() was expected to throw.');
-        } catch (InvalidPaginationException $e) {
-            self::assertSame(400, $e->httpStatus());
-        }
-    }
-
     public function test_paginate_rejects_a_non_positive_page(): void
     {
         $this->expectException(InvalidPaginationException::class);
@@ -748,10 +733,9 @@ final class QueryTest extends TestCase
     }
 
     /**
-     * An unordered query is a construction mistake, not a bad request:
+     * An unordered query is a construction mistake, not a bad argument:
      * the server may return rows in any order, so page 2 can repeat or
-     * skip rows from page 1. QueryBuilderException carries no HTTP
-     * status, so it reaches the client as an ordinary 500.
+     * skip rows from page 1.
      */
     public function test_paginate_refuses_a_query_with_no_order(): void
     {

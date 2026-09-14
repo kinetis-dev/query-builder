@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder\Tests\Fixtures;
 
-/** Hydration target for the real-backend qualified-cursor tests. */
+/** Mapping target for the qualified-cursor and projection tests. */
 final readonly class CursorReviewItem
 {
     public function __construct(

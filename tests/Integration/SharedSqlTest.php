@@ -402,9 +402,9 @@ final class SharedSqlTest extends TestCase
         self::assertSame(['a1', 'a3'], $articles()->orderBy('id')->pluck('slug'));
     }
 
-    /** selectExists() reads back as the integers 1 and 0, and a DTO's bool hydrates from them. */
+    /** selectExists() reads back as the integers 1 and 0, and a DTO's bool maps from them. */
     #[DataProvider('backends')]
-    public function test_select_exists_reads_back_one_or_zero_and_hydrates_into_bool(string $backend): void
+    public function test_select_exists_reads_back_one_or_zero_and_maps_into_bool(string $backend): void
     {
         $link = $this->link($backend);
         self::createArticles($link, $backend);

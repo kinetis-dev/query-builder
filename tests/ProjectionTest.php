@@ -8,6 +8,7 @@ use InvalidArgumentException;
 use Kinetis\Persistence\Driver\BufferedSqlResult;
 use Kinetis\QueryBuilder\Conditions;
 use Kinetis\QueryBuilder\Exception\QueryBuilderException;
+use Kinetis\QueryBuilder\Exception\RowMappingException;
 use Kinetis\QueryBuilder\Query;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakeMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\FakePostgresLink;
@@ -344,7 +345,7 @@ final class ProjectionTest extends TestCase
         yield 'sum()' => [static fn (Query $q) => $q->sum('id')];
     }
 
-    public function test_get_hydrates_dtos_only_when_a_class_is_given(): void
+    public function test_get_maps_dtos_only_when_a_class_is_given(): void
     {
         $link = new QueuedRowsMysqlLink([
             new QueuedSqlResult([['id' => 1, 'name' => 'n1', 'label' => 'l1']]),
@@ -356,6 +357,54 @@ final class ProjectionTest extends TestCase
         $item = new Query($link)->table('items')->first(Fixtures\CursorReviewItem::class);
         self::assertInstanceOf(Fixtures\CursorReviewItem::class, $item);
         self::assertSame('l1', $item->label);
+    }
+
+    /** A missing column and a null for a non-nullable parameter are mapping failures of the query builder's own. */
+    public function test_get_refuses_a_row_its_dto_cannot_take(): void
+    {
+        $link = new QueuedRowsMysqlLink([
+            new QueuedSqlResult([['id' => 1, 'name' => 'n1']]),
+            new QueuedSqlResult([['id' => 1, 'name' => null, 'label' => 'l1']]),
+        ]);
+        $class = Fixtures\CursorReviewItem::class;
+
+        try {
+            new Query($link)->table('items')->get($class);
+            self::fail('get() was expected to throw.');
+        } catch (RowMappingException $e) {
+            self::assertSame(
+                "The row has no \"label\" column for the constructor parameter of that name on {$class}, which has no default.",
+                $e->getMessage(),
+            );
+        }
+
+        try {
+            new Query($link)->table('items')->get($class);
+            self::fail('get() was expected to throw.');
+        } catch (RowMappingException $e) {
+            self::assertSame(
+                "Column \"name\" cannot map onto {$class}: the parameter takes a string, got null.",
+                $e->getMessage(),
+            );
+        }
+    }
+
+    public function test_cursor_paginate_maps_the_delivered_rows(): void
+    {
+        $link = new QueuedRowsMysqlLink([
+            new QueuedSqlResult([
+                ['id' => '1', 'name' => 'n1', 'label' => 'l1'],
+                ['id' => '2', 'name' => 'n2', 'label' => 'l2'],
+            ]),
+        ]);
+
+        $page = new Query($link)->table('items')->cursorPaginate(1, null, dtoClass: Fixtures\CursorReviewItem::class);
+
+        self::assertCount(1, $page->data);
+        self::assertInstanceOf(Fixtures\CursorReviewItem::class, $page->data[0]);
+        self::assertSame(1, $page->data[0]->id);
+        self::assertSame('1', $page->nextCursor);
+        self::assertTrue($page->hasMore);
     }
 
     public function test_insert_get_id_still_reads_a_generated_key_through_the_dialect(): void

@@ -6,7 +6,6 @@ namespace Kinetis\QueryBuilder;
 
 use BackedEnum;
 use InvalidArgumentException;
-use Kinetis\Validation\Absent;
 use UnitEnum;
 
 /**
@@ -18,9 +17,9 @@ final class RowValues
 {
     /**
      * Reads the object's initialized public properties, as seen from
-     * outside it. Absent::Value is omitted, null is kept as a SQL NULL, and
-     * a backed enum becomes its backing value. Every other value must
-     * already be a bool, an int, a finite float or a string.
+     * outside it. null is kept as a SQL NULL, and a backed enum becomes its
+     * backing value. Every other value must already be a bool, an int, a
+     * finite float or a string.
      *
      * @param array<string, string> $columns property => target column rename
      * @param list<string> $except public properties to omit
@@ -69,11 +68,6 @@ final class RowValues
             }
 
             $sourceOf[$column] = $property;
-
-            if ($value === Absent::Value) {
-                continue;
-            }
-
             $row[$column] = self::sqlValue($class, $property, $value);
         }
 

@@ -6,8 +6,6 @@ namespace Kinetis\QueryBuilder;
 
 use Closure;
 use InvalidArgumentException;
-use Kinetis\Http\Pagination\CursorPaginator;
-use Kinetis\Http\Pagination\Paginator;
 use Kinetis\Persistence\Contract\MysqlLink;
 use Kinetis\Persistence\Contract\PostgresLink;
 use Kinetis\Persistence\Contract\PrefersPreparedStatements;
@@ -17,7 +15,6 @@ use Kinetis\QueryBuilder\Dialect\MySqlDialect;
 use Kinetis\QueryBuilder\Dialect\PostgresDialect;
 use Kinetis\QueryBuilder\Exception\InvalidPaginationException;
 use Kinetis\QueryBuilder\Exception\QueryBuilderException;
-use Kinetis\Validation\Hydrator;
 
 /**
  * A thin, parameterized SQL query builder over the SQL MySQL 8.4,
@@ -735,13 +732,14 @@ final class Query
             throw QueryBuilderException::lockNeedsATransaction();
         }
 
+        $mapper = $dtoClass !== null ? RowMapper::for($dtoClass) : null;
         $compiled = $this->toSelectSql();
         $result = $this->run($compiled->sql, $compiled->params, $this->containsRawQuestionMark());
 
         $rows = [];
 
         foreach ($result as $row) {
-            $rows[] = $dtoClass !== null ? Hydrator::hydrate($dtoClass, $row) : $row;
+            $rows[] = $mapper !== null ? $mapper->map($row) : $row;
         }
 
         return $rows;
@@ -918,7 +916,7 @@ final class Query
      * PHP row cannot hold two values under one key. A qualified
      * $cursorColumn therefore requires $cursorAlias: the column is
      * additionally selected under that name, read back from it, and
-     * stripped from every returned row before hydration.
+     * stripped from every returned row before mapping.
      * {@see assertAliasIsFreeInProjection()} rejects an alias a listed
      * column already answers to; a wildcard's contents stay the caller's
      * own precondition. An unqualified $cursorColumn is already its own
@@ -935,6 +933,7 @@ final class Query
         ?string $cursorAlias = null,
     ): CursorPaginator {
         $this->assertCursorPaginateArguments($perPage, $cursorColumn, $cursorAlias);
+        $mapper = $dtoClass !== null ? RowMapper::for($dtoClass) : null;
 
         // Only ever true for an *unqualified* column, whose own name is
         // the row key: a qualified one always arrives here aliased.
@@ -984,11 +983,7 @@ final class Query
             );
         }
 
-        $data = $dtoClass !== null
-            ? array_map(static fn (array $row) => Hydrator::hydrate($dtoClass, $row), $rows)
-            : $rows;
-
-        return new CursorPaginator($data, $nextCursor, $hasMore);
+        return new CursorPaginator($mapper !== null ? array_map($mapper->map(...), $rows) : $rows, $nextCursor, $hasMore);
     }
 
     /**

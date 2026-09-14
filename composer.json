@@ -1,6 +1,6 @@
 {
     "name": "kinetis/query-builder",
-    "description": "A thin, parameterized SQL query builder for Kinetis — MySQL and Postgres via kinetis/persistence's drivers, row-to-DTO mapping via Kinetis\\Validation\\Hydrator. Not an ORM: no relationships, no migrations, no change-tracking.",
+    "description": "A thin, parameterized SQL query builder over kinetis/persistence's MySQL and Postgres drivers, with portable row-to-DTO mapping and pagination envelopes. Usable standalone. Not an ORM: no relationships, no migrations, no change-tracking.",
     "type": "library",
     "license": "MIT",
     "authors": [
@@ -10,11 +10,11 @@
     ],
     "require": {
         "php": "^8.4",
-        "kinetis/framework": "dev-main",
         "kinetis/persistence": "dev-main"
     },
     "require-dev": {
         "infection/infection": "^0.35.0",
+        "kinetis/framework": "dev-main",
         "phpstan/phpstan": "^2.2.8",
         "phpunit/phpunit": "^13.3.3",
         "vimeo/psalm": "^6.17"

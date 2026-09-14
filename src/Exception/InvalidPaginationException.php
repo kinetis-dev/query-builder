@@ -4,25 +4,17 @@ declare(strict_types=1);
 
 namespace Kinetis\QueryBuilder\Exception;
 
-use Kinetis\Http\Exception\HttpStatusExceptionInterface;
 use InvalidArgumentException;
 
 /**
  * paginate()/cursorPaginate() arguments that leave pagination without a
- * meaning — a non-positive page/perPage, an ambiguous cursor alias.
- * These trace back to an unvalidated HTTP query parameter, so this maps
- * to a 400 the same way MalformedRequestBodyException does, rather than
- * the generic 500 an uncaught InvalidArgumentException would reach
- * ExceptionHandlerMiddleware as.
+ * meaning — a non-positive page/perPage, a clause the cursor would
+ * contradict, an ambiguous cursor alias. A caller-argument failure,
+ * thrown before any SQL runs, unlike QueryBuilderException's refusals of
+ * a query's own shape.
  */
-final class InvalidPaginationException extends InvalidArgumentException implements HttpStatusExceptionInterface
+final class InvalidPaginationException extends InvalidArgumentException
 {
-    #[\Override]
-    public function httpStatus(): int
-    {
-        return 400;
-    }
-
     public static function nonPositivePerPage(string $method, int $perPage): self
     {
         return new self("{$method} needs a perPage of at least 1, got {$perPage}.");

@@ -14,7 +14,6 @@ use Kinetis\QueryBuilder\Tests\Fixtures\ArticleWrite;
 use Kinetis\QueryBuilder\Tests\Fixtures\SpyMysqlLink;
 use Kinetis\QueryBuilder\Tests\Fixtures\UnitVisibility;
 use Kinetis\QueryBuilder\Tests\Fixtures\ValueHolder;
-use Kinetis\Validation\Absent;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use stdClass;
@@ -22,16 +21,16 @@ use stdClass;
 final class RowValuesTest extends TestCase
 {
     /**
-     * Absent is omitted, a backed enum becomes its value, and only
-     * initialized public properties — readonly and asymmetric-visibility
-     * ones included — are read.
+     * A backed enum becomes its value, and only initialized public
+     * properties — readonly and asymmetric-visibility ones included — are
+     * read.
      */
-    public function test_reads_initialized_public_properties_and_omits_absent(): void
+    public function test_reads_initialized_public_properties(): void
     {
         $row = RowValues::fromObject(new ArticleWrite('Hello', ArticleStatus::Published, authorId: 7));
 
         self::assertSame(
-            ['slug' => 'hello-world', 'title' => 'Hello', 'status' => 'published', 'authorId' => 7],
+            ['slug' => 'hello-world', 'title' => 'Hello', 'status' => 'published', 'summary' => null, 'authorId' => 7],
             $row,
         );
     }
@@ -101,15 +100,6 @@ final class RowValuesTest extends TestCase
         ];
     }
 
-    /** A collision is structural: it is refused even when one side is Absent. */
-    public function test_a_collision_with_an_absent_property_is_still_refused(): void
-    {
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('maps both "title" and "summary"');
-
-        RowValues::fromObject(new ArticleWrite('Hello', ArticleStatus::Draft), columns: ['summary' => 'title']);
-    }
-
     /**
      * @param callable(): mixed $value
      */
@@ -155,9 +145,9 @@ final class RowValuesTest extends TestCase
     }
 
     /** An object with nothing to write yields [], and the write terminals keep refusing empty input. */
-    public function test_an_all_absent_object_yields_an_empty_row_the_writes_still_refuse(): void
+    public function test_an_object_without_public_properties_yields_an_empty_row_the_writes_still_refuse(): void
     {
-        $values = RowValues::fromObject(new ValueHolder(Absent::Value));
+        $values = RowValues::fromObject(new stdClass());
         self::assertSame([], $values);
 
         $spy = new SpyMysqlLink();
