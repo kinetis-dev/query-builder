@@ -10,11 +10,11 @@
     ],
     "require": {
         "php": "^8.4",
-        "kinetis/persistence": "dev-main"
+        "kinetis/persistence": "^1.4.0"
     },
     "require-dev": {
         "infection/infection": "^0.35.0",
-        "kinetis/framework": "dev-main",
+        "kinetis/framework": "^1.11.0",
         "phpstan/phpstan": "^2.2.8",
         "phpunit/phpunit": "^13.3.3",
         "vimeo/psalm": "^6.17"
@@ -32,16 +32,6 @@
     "extra": {
         "kinetis": {}
     },
-    "repositories": [
-        {
-            "type": "path",
-            "url": "../framework"
-        },
-        {
-            "type": "path",
-            "url": "../persistence"
-        }
-    ],
     "config": {
         "sort-packages": true,
         "allow-plugins": {
