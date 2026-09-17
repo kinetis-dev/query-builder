@@ -269,6 +269,26 @@ final class InlineLiteralsTest extends TestCase
         self::assertSame('execute', $spy->calls[0]->method);
     }
 
+    /**
+     * PDO PostgreSQL parses a bare "?" as a placeholder and turns "??"
+     * into a literal "?" — PostgreSQL's own jsonb operator; native
+     * ext-pgsql sends both strings verbatim, so a raw "??" only reaches
+     * PostgreSQL as that operator through persistence's execute(), whose
+     * placeholder scanner applies the "??" escape. A raw "??" with
+     * nothing to bind must still reach execute() with an empty parameter
+     * list rather than being routed to query() as a zero-parameter
+     * statement — see Query::run().
+     */
+    public function test_a_raw_question_mark_with_no_params_still_reaches_execute_on_postgres(): void
+    {
+        $spy = new SpyPostgresLink();
+        new Query($spy)->table('items')->whereRaw("payload ?? 'key'")->get();
+
+        self::assertSame('execute', $spy->calls[0]->method);
+        self::assertSame('SELECT * FROM "items" WHERE payload ?? \'key\'', $spy->calls[0]->sql);
+        self::assertSame([], $spy->calls[0]->params);
+    }
+
     public function test_a_driver_preferring_prepared_statements_binds_instead_of_inlining(): void
     {
         // Same query as the first test in this file, same dialect, same

@@ -184,25 +184,39 @@ final class Query
     }
 
     /**
-     * $link->execute() goes through the server's prepared-statement
-     * protocol; $link->query() does not. A query with nothing to bind
-     * therefore always takes query(), and one whose parameters are all
-     * safe to write into the SQL text may — see inlineLiterals(), which
-     * decides on the driver rather than on this class.
+     * $link->execute() is the shared, dialect-aware path: it resolves
+     * this class's own "?" bindings by position and, through
+     * persistence's scanner, treats "??" as the escape for a literal
+     * "?" — needed for PostgreSQL's own jsonb "?"/"?|"/"?&" operators,
+     * lexically identical to a bind placeholder where they appear.
+     * $link->query() carries no such shared placeholder or escape
+     * handling at all, so what a raw "?" it receives means is left to
+     * the driver underneath rather than to any contract Kinetis defines
+     * — driver-dependent behavior this class must not rely on. A query
+     * with nothing to bind and no raw "?" therefore takes query(), and
+     * one whose parameters are all safe to write into the SQL text
+     * may — see inlineLiterals(), which decides on the driver rather
+     * than on this class.
      *
      * Every "?" this class emits itself has exactly one binding pushed at
      * the same time, which is what makes a positional substitution safe.
-     * A "?" in raw SQL text breaks that: it may never have been a
-     * placeholder, so $hasRawQuestionMark sends the whole statement to
-     * execute() rather than telling a real placeholder from a decoy one.
-     * Raw text without a "?" cannot shift a substitution, so it leaves
-     * inlining alone.
+     * A "?" in raw SQL text breaks that: it may be a PostgreSQL jsonb
+     * operator rather than a placeholder, written "??" so persistence's
+     * scanner can tell the two apart, so $hasRawQuestionMark sends the
+     * whole statement to execute() rather than guessing — even with zero
+     * bound parameters, since only execute() runs that scanner. query()
+     * gives no such guarantee: the verified PDO PostgreSQL driver parses
+     * a bare "?" as a placeholder itself and turns "??" into a literal
+     * "?", while native pgsql sends both strings verbatim, so the same
+     * raw fragment would mean two different things depending on which
+     * driver received it. Raw text without a "?" cannot shift a
+     * substitution, so it leaves inlining alone.
      *
      * @param list<mixed> $params
      */
     private function run(string $sql, array $params, bool $hasRawQuestionMark): SqlResult
     {
-        if ($params === []) {
+        if ($params === [] && !$hasRawQuestionMark) {
             return $this->link->query($sql);
         }
 
