@@ -87,8 +87,15 @@ final class Query
 
     private bool $distinct = false;
 
-    /** @var list<string> */
-    private array $selectColumns = ['*'];
+    /**
+     * The identifiers select() listed, in call order. An empty list is an
+     * untouched projection, not a wildcard: an explicit select('*') is a
+     * listed column like any other, and the two differ once a select
+     * expression is added.
+     *
+     * @var list<string>
+     */
+    private array $selectColumns = [];
 
     /**
      * selectAs(), selectRaw(), selectSub() and selectExists()
@@ -101,11 +108,11 @@ final class Query
     /**
      * An already-quoted `expr AS alias` fragment appended to the compiled
      * SELECT list, set only on cursorPaginate()'s own clone. Separate
-     * from $selectExpressions above because those are subject to
-     * compileSelectColumns()'s "drop the default wildcard once something
-     * explicit was asked for" rule, which is right for a caller's own
-     * expression and wrong here: appending a cursor alias must never
-     * silently take `*` away from a projection the caller never touched.
+     * from $selectExpressions above because an expression there makes
+     * the projection a touched one, which compiles without the implicit
+     * `*`. That is right for a caller's own expression and wrong here:
+     * appending a cursor alias must never silently take `*` away from a
+     * projection the caller never touched.
      */
     private ?string $cursorAliasExpression = null;
 
@@ -318,9 +325,18 @@ final class Query
         return $this->addCte('withRecursive()', $name, $query, $columns, true);
     }
 
+    /**
+     * Appends each identifier to the projection in call order, like every
+     * other select method: a later call extends the earlier one, so
+     * layered code can add to a projection it did not choose. A different
+     * logical projection is a different Query. Nothing is deduplicated,
+     * a call without arguments appends nothing, and one argument is one
+     * identifier — select('a, b') names a column of that whole spelling,
+     * select('a', 'b') names two.
+     */
     public function select(string ...$columns): static
     {
-        $this->selectColumns = $columns === [] ? ['*'] : array_values($columns);
+        array_push($this->selectColumns, ...$columns);
 
         return $this;
     }
@@ -951,8 +967,11 @@ final class Query
      * column already answers to; a wildcard's contents and the result
      * names of the select expressions stay the caller's own
      * precondition. An unqualified $cursorColumn is already its own row
-     * key: it needs no alias, and is added to the projection only when a
-     * select() chose columns that omit it.
+     * key: it needs no alias, and is added to the projection only when
+     * nothing there delivers that key already. A wildcard of either
+     * spelling does, as does a listed column of that bare name,
+     * qualified or not; a projection of select expressions alone does
+     * not. {@see projectionDeliversColumn()}
      *
      * @param class-string|null $dtoClass
      */
@@ -967,9 +986,14 @@ final class Query
         $mapper = $dtoClass !== null ? RowMapper::for($dtoClass) : null;
 
         // Only ever true for an *unqualified* column, whose own name is
-        // the row key: a qualified one always arrives here aliased.
+        // the row key: a qualified one always arrives here aliased. An
+        // untouched projection compiles to the wildcard, which carries
+        // the column; select expressions alone never do, so what is left
+        // is a question about the listed columns rather than about
+        // whether the projection was touched at all.
         $projectionIncludesCursorColumn = $cursorAlias === null
-            && ($this->selectColumns === ['*'] || in_array($cursorColumn, $this->selectColumns, true));
+            && ($this->projectionIsUntouched()
+                || self::projectionDeliversColumn($this->selectColumns, $cursorColumn));
 
         $page = clone $this;
 
@@ -1107,16 +1131,52 @@ final class Query
     private static function assertAliasIsFreeInProjection(array $selectColumns, string $cursorAlias): void
     {
         foreach ($selectColumns as $column) {
-            if ($column === '*' || str_ends_with($column, '.*')) {
+            if (self::isWildcard($column)) {
                 continue;
             }
 
-            $bareName = str_contains($column, '.') ? substr($column, (int) strrpos($column, '.') + 1) : $column;
-
-            if ($bareName === $cursorAlias) {
+            if (self::bareName($column) === $cursorAlias) {
                 throw InvalidPaginationException::cursorAliasCollision($cursorAlias, $column);
             }
         }
+    }
+
+    /**
+     * Whether the listed columns already deliver $cursorColumn — always
+     * unqualified here — under its own row key, which decides both the
+     * column cursorPaginate() adds and the cleanup that removes it. A
+     * projected name is read exactly as
+     * {@see assertAliasIsFreeInProjection()} reads it: a listed
+     * `orders.id` claims the same bare `id` key as a listed `id`, and a
+     * wildcard of either spelling expands to columns no name here can
+     * be compared against, so it counts as carrying the column. Adding
+     * one of those a second time would duplicate it, and the strip that
+     * follows removes the key whatever put it there — the caller's own
+     * value with it. A wildcard over a table without the column is
+     * caught after the query by {@see nextCursorFromRow()}.
+     *
+     * @param list<string> $selectColumns
+     */
+    private static function projectionDeliversColumn(array $selectColumns, string $cursorColumn): bool
+    {
+        foreach ($selectColumns as $column) {
+            if (self::isWildcard($column) || self::bareName($column) === $cursorColumn) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function isWildcard(string $column): bool
+    {
+        return $column === '*' || str_ends_with($column, '.*');
+    }
+
+    /** The key both engines report a listed column under: its last dot-separated segment. */
+    private static function bareName(string $column): string
+    {
+        return str_contains($column, '.') ? substr($column, (int) strrpos($column, '.') + 1) : $column;
     }
 
     /**
@@ -1688,18 +1748,26 @@ final class Query
     }
 
     /**
-     * The default "*" is dropped once anything explicit — select(),
-     * selectAs(), selectRaw(), selectSub() or selectExists() — has been
-     * specified: a caller reaching only for selectRaw('COUNT(*) AS total')
-     * wants exactly that, not also every column. Once select() has been
-     * called $selectColumns is no longer literally ['*'], so the explicit
-     * columns and the expressions combine normally.
+     * Whether nothing has been projected yet: no listed column and no
+     * select expression. This is the one state that compiles to "*", so
+     * it is what an explicit select('*') no longer stands in for.
+     */
+    private function projectionIsUntouched(): bool
+    {
+        return $this->selectColumns === [] && $this->selectExpressions === [];
+    }
+
+    /**
+     * An untouched projection compiles as "*", and only an untouched one:
+     * a caller reaching for selectRaw('COUNT(*) AS total') alone wants
+     * exactly that, not also every column, while one who listed "*"
+     * themselves keeps it in front of their expressions.
      */
     private function compileSelectColumns(): CompiledQuery
     {
         $expressions = array_map(
             $this->compileSelectColumn(...),
-            $this->selectColumns === ['*'] && $this->selectExpressions !== [] ? [] : $this->selectColumns,
+            $this->projectionIsUntouched() ? ['*'] : $this->selectColumns,
         );
         $params = [];
 
@@ -1807,7 +1875,7 @@ final class Query
             'a table() alias' => $this->tableAlias !== null,
             'fromSub()' => $this->fromSub !== null,
             'distinct()' => $this->distinct,
-            'select()/selectAs()/selectRaw()/selectSub()/selectExists()' => $this->selectColumns !== ['*'] || $this->selectExpressions !== [],
+            'select()/selectAs()/selectRaw()/selectSub()/selectExists()' => !$this->projectionIsUntouched(),
             'join()/leftJoin()/joinOn()/joinSub()/crossJoin()' => $this->joins !== [],
             'groupBy()/groupByRaw()' => $this->groups !== [],
             'having()/orHaving()/havingRaw()' => !$this->havings->isEmpty(),

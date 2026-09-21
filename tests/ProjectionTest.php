@@ -102,6 +102,40 @@ final class ProjectionTest extends TestCase
     }
 
     /**
+     * select() appends like every other select method, so layered code
+     * can extend a projection it did not choose. Nothing is
+     * deduplicated, and a call without arguments appends nothing rather
+     * than resetting the projection.
+     */
+    public function test_select_appends_every_call_in_order(): void
+    {
+        $compiled = self::mysql()->table('orders')
+            ->select('id')
+            ->select('total', 'orders.id')
+            ->select()
+            ->toSelectSql();
+
+        self::assertSame('SELECT `id`, `total`, `orders`.`id` FROM `orders`', $compiled->sql);
+    }
+
+    /**
+     * A listed wildcard is an ordinary column, not the untouched default
+     * an expression replaces: both spellings survive the expressions
+     * appended after them.
+     */
+    public function test_an_explicitly_listed_wildcard_survives_a_select_expression(): void
+    {
+        self::assertSame(
+            'SELECT *, `customers`.`name` AS `customerName` FROM `orders`',
+            self::mysql()->table('orders')->select('*')->selectAs('customers.name', 'customerName')->toSelectSql()->sql,
+        );
+        self::assertSame(
+            'SELECT `orders`.*, COUNT(*) AS line_count FROM `orders`',
+            self::mysql()->table('orders')->select('orders.*')->selectRaw('COUNT(*) AS line_count')->toSelectSql()->sql,
+        );
+    }
+
+    /**
      * The alias is the row key, so it is what reaches a DTO parameter of
      * that name. Selecting the column itself leaves the parameter at its
      * default instead, which is the silent outcome selectAs() exists to

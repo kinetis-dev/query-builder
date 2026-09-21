@@ -950,6 +950,65 @@ final class QueryTest extends TestCase
         );
     }
 
+    /**
+     * A projection of select expressions alone compiles no wildcard, so
+     * it carries the cursor column no more than a listed projection that
+     * omits it does: the column is selected for the cursor's sake and
+     * taken back out of the delivered rows.
+     */
+    public function test_cursor_paginate_adds_the_cursor_column_to_an_expression_only_projection(): void
+    {
+        $link = new QueuedRowsMysqlLink([
+            new QueuedSqlResult([
+                ['amount' => 40, 'id' => 7],
+                ['amount' => 60, 'id' => 8],
+            ]),
+        ]);
+
+        $page = new Query($link)->table('orders')->selectAs('orders.total', 'amount')
+            ->cursorPaginate(1, null, cursorColumn: 'id');
+
+        self::assertSame(
+            'SELECT `id`, `orders`.`total` AS `amount` FROM `orders` ORDER BY `id` ASC LIMIT 2',
+            $link->calls[0]->sql,
+        );
+        self::assertSame('7', $page->nextCursor);
+        self::assertSame([['amount' => 40]], $page->data);
+    }
+
+    /**
+     * A listed projection that already delivers the cursor column's row
+     * key is left as the caller wrote it: selecting the column a second
+     * time would duplicate it, and the strip that follows removes the
+     * key whatever put it there — taking the caller's own value with it.
+     * A wildcard expands to the column under either spelling, and a
+     * qualified `orders.id` arrives under the same bare `id` key an
+     * unqualified one would.
+     */
+    #[DataProvider('projectionsCarryingTheCursorKey')]
+    public function test_cursor_paginate_leaves_a_projection_that_already_delivers_the_cursor_key(string $column, string $sql): void
+    {
+        $link = new QueuedRowsMysqlLink([
+            new QueuedSqlResult([['id' => 7], ['id' => 8]]),
+        ]);
+
+        $page = new Query($link)->table('orders')->select($column)->cursorPaginate(1, null, cursorColumn: 'id');
+
+        self::assertSame($sql, $link->calls[0]->sql);
+        self::assertSame('7', $page->nextCursor);
+        self::assertSame([['id' => 7]], $page->data);
+    }
+
+    /**
+     * @return iterable<string, array{string, string}>
+     */
+    public static function projectionsCarryingTheCursorKey(): iterable
+    {
+        yield 'a bare wildcard' => ['*', 'SELECT * FROM `orders` ORDER BY `id` ASC LIMIT 2'];
+        yield 'a qualified wildcard' => ['orders.*', 'SELECT `orders`.* FROM `orders` ORDER BY `id` ASC LIMIT 2'];
+        yield 'the cursor column qualified' => ['orders.id', 'SELECT `orders`.`id` FROM `orders` ORDER BY `id` ASC LIMIT 2'];
+    }
+
     public function test_cursor_paginate_does_not_duplicate_the_cursor_column_when_the_projection_already_has_it(): void
     {
         $spy = new SpyMysqlLink();
