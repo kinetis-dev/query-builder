@@ -91,8 +91,8 @@ final class Query
     private array $selectColumns = ['*'];
 
     /**
-     * selectRaw(), selectSub() and selectExists() expressions, rendered, in
-     * call order.
+     * selectAs(), selectRaw(), selectSub() and selectExists()
+     * expressions, rendered, in call order.
      *
      * @var list<array{sql: string, params: list<mixed>}>
      */
@@ -321,6 +321,22 @@ final class Query
     public function select(string ...$columns): static
     {
         $this->selectColumns = $columns === [] ? ['*'] : array_values($columns);
+
+        return $this;
+    }
+
+    /**
+     * One column selected under a different result name, both quoted as
+     * identifiers. The alias is the row key, so it is what value(),
+     * pluck() and a DTO parameter read. Appends in call order like any
+     * other select expression, and binds nothing.
+     */
+    public function selectAs(string $column, string $as): static
+    {
+        $this->selectExpressions[] = [
+            'sql' => $this->dialect->quoteIdentifier($column) . ' AS ' . $this->dialect->quoteIdentifier($as),
+            'params' => [],
+        ];
 
         return $this;
     }
@@ -932,10 +948,11 @@ final class Query
      * additionally selected under that name, read back from it, and
      * stripped from every returned row before mapping.
      * {@see assertAliasIsFreeInProjection()} rejects an alias a listed
-     * column already answers to; a wildcard's contents stay the caller's
-     * own precondition. An unqualified $cursorColumn is already its own
-     * row key: it needs no alias, and is added to the projection only
-     * when a select() chose columns that omit it.
+     * column already answers to; a wildcard's contents and the result
+     * names of the select expressions stay the caller's own
+     * precondition. An unqualified $cursorColumn is already its own row
+     * key: it needs no alias, and is added to the projection only when a
+     * select() chose columns that omit it.
      *
      * @param class-string|null $dtoClass
      */
@@ -1076,12 +1093,14 @@ final class Query
      * alias removes the caller's field with it — silently, since the key
      * is present either way.
      *
-     * This sees the explicit projection only: `select('t.row_cursor')`
-     * claims the same bare key as `select('row_cursor')`, since both
-     * engines report a qualified column under its last segment. A
-     * wildcard's contents and an alias buried in a selectRaw() stay the
-     * caller's own precondition — knowing either needs column metadata
-     * SqlResult does not carry.
+     * This sees the listed columns only: `select('t.row_cursor')` claims
+     * the same bare key as `select('row_cursor')`, since both engines
+     * report a qualified column under its last segment. Two projected
+     * names stay the caller's own precondition: a wildcard's contents,
+     * which need column metadata SqlResult does not carry, and the
+     * result name of a select expression — selectAs()'s alias as much as
+     * one buried in a selectRaw() — which the expression list keeps as
+     * rendered SQL rather than a name to compare.
      *
      * @param list<string> $selectColumns
      */
@@ -1670,11 +1689,11 @@ final class Query
 
     /**
      * The default "*" is dropped once anything explicit — select(),
-     * selectRaw(), selectSub() or selectExists() — has been specified: a
-     * caller reaching only for selectRaw('COUNT(*) AS total') wants exactly
-     * that, not also every column. Once select() has been called
-     * $selectColumns is no longer literally ['*'], so the explicit columns
-     * and the expressions combine normally.
+     * selectAs(), selectRaw(), selectSub() or selectExists() — has been
+     * specified: a caller reaching only for selectRaw('COUNT(*) AS total')
+     * wants exactly that, not also every column. Once select() has been
+     * called $selectColumns is no longer literally ['*'], so the explicit
+     * columns and the expressions combine normally.
      */
     private function compileSelectColumns(): CompiledQuery
     {
@@ -1788,7 +1807,7 @@ final class Query
             'a table() alias' => $this->tableAlias !== null,
             'fromSub()' => $this->fromSub !== null,
             'distinct()' => $this->distinct,
-            'select()/selectRaw()/selectSub()/selectExists()' => $this->selectColumns !== ['*'] || $this->selectExpressions !== [],
+            'select()/selectAs()/selectRaw()/selectSub()/selectExists()' => $this->selectColumns !== ['*'] || $this->selectExpressions !== [],
             'join()/leftJoin()/joinOn()/joinSub()/crossJoin()' => $this->joins !== [],
             'groupBy()/groupByRaw()' => $this->groups !== [],
             'having()/orHaving()/havingRaw()' => !$this->havings->isEmpty(),

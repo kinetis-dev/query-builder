@@ -145,7 +145,7 @@ final class WriteTest extends TestCase
         yield 'upsert() with a select' => [
             static fn (Query $q) => $q->select('id')->upsert(['name' => 'a'], ['name'], ['name']),
             'upsert()',
-            'select()/selectRaw()/selectSub()/selectExists()',
+            'select()/selectAs()/selectRaw()/selectSub()/selectExists()',
         ];
         yield 'insertUsing() with its own CTE' => [
             static fn (Query $q) => $q->with('x', new Query(new SpyMysqlLink())->table('y'))

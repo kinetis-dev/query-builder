@@ -371,7 +371,7 @@ final class QueryTest extends TestCase
     {
         $other = static fn (): Query => new Query(new SpyMysqlLink())->table('orders')->select('user_id');
         $joins = 'join()/leftJoin()/joinOn()/joinSub()/crossJoin()';
-        $projection = 'select()/selectRaw()/selectSub()/selectExists()';
+        $projection = 'select()/selectAs()/selectRaw()/selectSub()/selectExists()';
 
         yield 'with()' => [static fn (Query $q) => $q->with('recent', $other()), 'with()/withRecursive()'];
         yield 'a table alias' => [static fn (Query $q) => $q->table('users', as: 'u'), 'a table() alias'];

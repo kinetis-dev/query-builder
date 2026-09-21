@@ -55,6 +55,74 @@ final class ProjectionTest extends TestCase
         self::assertSame([30, 1, 3, true, 7, 0, 2, 2020, 'pinned', 'open'], $compiled->params);
     }
 
+    /**
+     * Both sides are quoted as identifiers per dialect, which is the
+     * whole point over select(): select('processed_at AS processedAt')
+     * quotes the three words as one column name, and PostgreSQL only
+     * keeps the alias's capitals because they are quoted.
+     */
+    public function test_select_as_quotes_the_source_column_and_the_alias_per_dialect(): void
+    {
+        self::assertSame(
+            'SELECT `orders`.`processed_at` AS `processedAt` FROM `orders`',
+            self::mysql()->table('orders')->selectAs('orders.processed_at', 'processedAt')->toSelectSql()->sql,
+        );
+        self::assertSame(
+            'SELECT "orders"."processed_at" AS "processedAt" FROM "orders"',
+            new Query(new FakePostgresLink())->table('orders')->selectAs('orders.processed_at', 'processedAt')
+                ->toSelectSql()->sql,
+        );
+    }
+
+    /** An explicit alias is an explicit projection: the default wildcard goes, as it does for selectRaw(). */
+    public function test_select_as_alone_drops_the_default_wildcard(): void
+    {
+        $compiled = self::mysql()->table('orders')->selectAs('processed_at', 'processedAt')->toSelectSql();
+
+        self::assertSame('SELECT `processed_at` AS `processedAt` FROM `orders`', $compiled->sql);
+        self::assertSame([], $compiled->params);
+    }
+
+    /** Listed columns lead, then every expression in call order, whichever order the calls came in. */
+    public function test_select_as_appends_after_the_listed_columns_in_call_order(): void
+    {
+        $compiled = self::mysql()->table('orders')
+            ->selectAs('orders.processed_at', 'processedAt')
+            ->selectRaw('total * ? AS weighted', [2])
+            ->select('orders.id', 'orders.total')
+            ->selectAs('customers.name', 'customerName')
+            ->toSelectSql();
+
+        self::assertSame(
+            'SELECT `orders`.`id`, `orders`.`total`, `orders`.`processed_at` AS `processedAt`, total * ? AS weighted, '
+            . '`customers`.`name` AS `customerName` FROM `orders`',
+            $compiled->sql,
+        );
+        self::assertSame([2], $compiled->params);
+    }
+
+    /**
+     * The alias is the row key, so it is what reaches a DTO parameter of
+     * that name. Selecting the column itself leaves the parameter at its
+     * default instead, which is the silent outcome selectAs() exists to
+     * avoid.
+     */
+    public function test_the_alias_is_the_key_an_optional_dto_parameter_maps_from(): void
+    {
+        $link = new QueuedRowsMysqlLink([
+            new QueuedSqlResult([['nullableInt' => 7]]),
+            new QueuedSqlResult([['nullable_int' => 7]]),
+        ]);
+
+        $aliased = new Query($link)->table('rows')->selectAs('nullable_int', 'nullableInt')->first(Fixtures\TypedRow::class);
+        self::assertInstanceOf(Fixtures\TypedRow::class, $aliased);
+        self::assertSame(7, $aliased->nullableInt);
+
+        $unaliased = new Query($link)->table('rows')->select('nullable_int')->first(Fixtures\TypedRow::class);
+        self::assertInstanceOf(Fixtures\TypedRow::class, $unaliased);
+        self::assertSame(0, $unaliased->nullableInt);
+    }
+
     public function test_a_correlated_select_sub_is_selected_under_its_alias(): void
     {
         $favorited = self::mysql()->table('favorites')
