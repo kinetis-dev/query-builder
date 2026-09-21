@@ -219,7 +219,7 @@ final class SharedSqlTest extends TestCase
     }
 
     #[DataProvider('backends')]
-    public function test_insert_or_ignore_skips_duplicates_only_and_upsert_updates_them(string $backend): void
+    public function test_insert_or_ignore_skips_conflicts_only_and_upsert_updates_them(string $backend): void
     {
         $link = $this->link($backend);
         self::recreate($link, 'kin_qb_tags', 'slug VARCHAR(20) PRIMARY KEY, label VARCHAR(50) NOT NULL, uses INT NOT NULL');
@@ -235,7 +235,7 @@ final class SharedSqlTest extends TestCase
         ]));
         self::assertSame('PHP', $tags()->where('slug', '=', 'php')->value('label'));
 
-        // A NOT NULL violation is not a duplicate: it still fails, and writes nothing.
+        // A NOT NULL violation is not a conflict: it still fails, and writes nothing.
         try {
             $tags()->insertOrIgnore(['slug' => 'rust', 'label' => null, 'uses' => 1]);
             self::fail('insertOrIgnore() was expected to fail on a NOT NULL violation.');
@@ -255,6 +255,33 @@ final class SharedSqlTest extends TestCase
         self::assertSame('PHP 8', $tags()->where('slug', '=', 'php')->value('label'));
         self::assertSame(5, (int) $tags()->where('slug', '=', 'php')->value('uses'));
         self::assertSame(4, $tags()->count());
+    }
+
+    /**
+     * PostgreSQL only: the targetless ON CONFLICT DO NOTHING also covers an
+     * exclusion constraint, so insertOrIgnore() silently skips the row that
+     * insert() raises as SQLSTATE 23P01. The MySQL family has no exclusion
+     * constraints and its spelling resolves unique keys alone.
+     */
+    public function test_postgres_insert_or_ignore_also_skips_an_exclusion_conflict(): void
+    {
+        $link = $this->link('postgres');
+        self::recreate($link, 'kin_qb_bookings', 'during TSTZRANGE NOT NULL, EXCLUDE USING gist (during WITH &&)');
+        $bookings = static fn (): Query => new Query($link)->table('kin_qb_bookings');
+        $overlapping = ['during' => '[2026-01-01 11:00+00,2026-01-01 13:00+00)'];
+
+        $bookings()->insert(['during' => '[2026-01-01 10:00+00,2026-01-01 12:00+00)']);
+
+        try {
+            $bookings()->insert($overlapping);
+            self::fail('insert() was expected to fail on the exclusion constraint.');
+        } catch (QueryException $e) {
+            self::assertSame('23P01', $e->getSqlState());
+            self::assertFalse($e->isUniqueViolation());
+        }
+
+        self::assertSame(0, $bookings()->insertOrIgnore($overlapping));
+        self::assertSame(1, $bookings()->count());
     }
 
     #[DataProvider('backends')]

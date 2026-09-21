@@ -191,7 +191,7 @@ final class WriteTest extends TestCase
         new Query(new SpyMysqlLink())->table('archive')->insertUsing([], new Query(new SpyMysqlLink())->table('articles'));
     }
 
-    public function test_insert_or_ignore_skips_only_unique_conflicts_per_dialect(): void
+    public function test_insert_or_ignore_compiles_per_dialect(): void
     {
         $mysql = new PreparingSpyMysqlLink();
         $postgres = new PreparingSpyPostgresLink();

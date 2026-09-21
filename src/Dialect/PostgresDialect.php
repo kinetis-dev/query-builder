@@ -47,7 +47,10 @@ final class PostgresDialect implements Dialect
         return true;
     }
 
-    /** No conflict target: a conflict on any unique constraint skips the row. */
+    /**
+     * No conflict target, so the row is skipped on a conflict with any
+     * unique constraint and with an exclusion constraint as well.
+     */
     #[\Override]
     public function insertOrIgnoreClause(array $columns): string
     {

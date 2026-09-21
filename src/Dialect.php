@@ -34,8 +34,9 @@ interface Dialect
     public function admitsLimitedInSubquery(): bool;
 
     /**
-     * The INSERT suffix that skips a row conflicting with a unique key
-     * while every other error still fails the statement.
+     * The INSERT suffix that skips a conflicting row while every other
+     * error still fails the statement. Which conflicts it covers differs
+     * per dialect; see each implementation.
      *
      * @param non-empty-list<string> $columns the inserted columns
      */

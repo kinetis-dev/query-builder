@@ -1166,9 +1166,15 @@ final class Query
     }
 
     /**
-     * Inserts the row or batch, skipping every row that conflicts with a
-     * unique key, and returns the number of rows inserted. Any other error
-     * still fails the whole statement.
+     * Inserts the row or batch, skipping every row the server reports as
+     * conflicting, and returns the number of rows inserted. Any other
+     * error still fails the whole statement.
+     *
+     * Which conflicts are skipped differs: the MySQL family skips a
+     * unique-key conflict, and PostgreSQL's targetless ON CONFLICT DO
+     * NOTHING also skips an exclusion-constraint conflict that insert()
+     * would raise as SQLSTATE 23P01. The count is rows inserted and does
+     * not say which constraint held a row back.
      *
      * @param array<string, mixed>|list<array<string, mixed>> $values
      */
