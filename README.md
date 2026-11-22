@@ -77,7 +77,7 @@ own.
 composer require kinetis/query-builder
 ```
 
-Requires PHP 8.4+ and [`kinetis/persistence`](https://github.com/kinetis-dev/persistence),
+Requires PHP 8.4 or 8.5 and [`kinetis/persistence`](https://github.com/kinetis-dev/persistence),
 plus the PHP extension for the driver you use. Full documentation:
 [kinetis.dev/docs/query-builder.html](https://kinetis.dev/docs/query-builder.html).
 
