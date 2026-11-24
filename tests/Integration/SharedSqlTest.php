@@ -30,7 +30,7 @@ use PHPUnit\Framework\TestCase;
  *
  * Environment-gated like CursorPaginateTest: it skips unless
  * MYSQL_HOST/POSTGRES_HOST is set. CI's integration workflow runs it with
- * MySQL 8.4 and MariaDB 11.4 behind MYSQL_HOST, and PostgreSQL 16.
+ * MySQL 9.7 and MariaDB 11.4 behind MYSQL_HOST, and PostgreSQL 18.
  */
 final class SharedSqlTest extends TestCase
 {
@@ -342,7 +342,7 @@ final class SharedSqlTest extends TestCase
     }
 
     /**
-     * MySQL 8.4 and MariaDB 11.4 both reject LIMIT inside IN (...), so the
+     * MySQL 9.7 and MariaDB 11.4 both reject LIMIT inside IN (...), so the
      * family's dialect refuses it before execution; PostgreSQL runs it.
      * The derived-table form runs everywhere.
      */

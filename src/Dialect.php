@@ -8,7 +8,7 @@ use Kinetis\Persistence\Contract\SqlResult;
 
 /**
  * Every spelling Query needs that differs between the MySQL family
- * (MySQL 8.4, MariaDB 11.4) and PostgreSQL 16. Everything else — "?"
+ * (MySQL 9.7, MariaDB 11.4) and PostgreSQL 18. Everything else — "?"
  * placeholders, joins, set operations, CTEs, exclusive lock clauses,
  * affected-row counts — is written once in Query.
  */

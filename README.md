@@ -26,7 +26,7 @@ Usable standalone: in production it depends only on
 
 Parameterized selects, joins, subqueries, set operations, CTEs, row
 locks, inserts, upserts, updates and deletes over the SQL shared by
-MySQL 8.4, MariaDB 11.4 and PostgreSQL 16, run through
+MySQL 9.7, MariaDB 11.4 and PostgreSQL 18, run through
 `kinetis/persistence`'s drivers, with its own row-to-DTO mapping and
 pagination envelopes. Not an ORM: no relationships, no change-tracking,
 no `save()`-on-a-model.

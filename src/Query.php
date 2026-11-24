@@ -17,8 +17,8 @@ use Kinetis\QueryBuilder\Exception\InvalidPaginationException;
 use Kinetis\QueryBuilder\Exception\QueryBuilderException;
 
 /**
- * A thin, parameterized SQL query builder over the SQL MySQL 8.4,
- * MariaDB 11.4 and PostgreSQL 16 share — not an ORM. No relationships,
+ * A thin, parameterized SQL query builder over the SQL MySQL 9.7,
+ * MariaDB 11.4 and PostgreSQL 18 share — not an ORM. No relationships,
  * no migrations, no change-tracking, no save()-on-a-model. One class
  * serves every target through the Kinetis\Persistence\Contract\SqlLink
  * family; the spellings that differ are isolated in Dialect.

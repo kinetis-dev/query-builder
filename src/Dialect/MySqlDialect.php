@@ -8,7 +8,7 @@ use Kinetis\QueryBuilder\Dialect;
 use Kinetis\Persistence\Contract\SqlResult;
 
 /**
- * MySQL 8.4 and MariaDB 11.4: every spelling here is one both servers
+ * MySQL 9.7 and MariaDB 11.4: every spelling here is one both servers
  * accept.
  */
 final class MySqlDialect implements Dialect
@@ -58,7 +58,7 @@ final class MySqlDialect implements Dialect
         return ' LOCK IN SHARE MODE';
     }
 
-    /** MySQL 8.4 and MariaDB 11.4 both reject it with error 1235. */
+    /** MySQL 9.7 and MariaDB 11.4 both reject it with error 1235. */
     #[\Override]
     public function admitsLimitedInSubquery(): bool
     {
@@ -81,7 +81,7 @@ final class MySqlDialect implements Dialect
 
     /**
      * VALUES(col) is the one spelling both servers share: MariaDB has no
-     * INSERT ... AS row alias, and MySQL 8.4 accepts VALUES() with
+     * INSERT ... AS row alias, and MySQL 9.7 accepts VALUES() with
      * deprecation warning 1287. Both match a conflict on any unique key of
      * the table, so $uniqueBy does not reach the SQL.
      */

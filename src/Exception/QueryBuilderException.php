@@ -123,7 +123,7 @@ final class QueryBuilderException extends RuntimeException
         );
     }
 
-    /** MySQL 8.4 and MariaDB 11.4 both reject the statement with error 1235. */
+    /** MySQL 9.7 and MariaDB 11.4 both reject the statement with error 1235. */
     public static function limitedInSubquery(string $method): self
     {
         return new self(

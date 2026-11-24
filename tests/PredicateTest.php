@@ -186,7 +186,7 @@ final class PredicateTest extends TestCase
     }
 
     /**
-     * MySQL 8.4 and MariaDB 11.4 both reject LIMIT inside IN (...), also
+     * MySQL 9.7 and MariaDB 11.4 both reject LIMIT inside IN (...), also
      * when it sits in a set operand, so the family's dialect refuses it
      * before execution.
      *

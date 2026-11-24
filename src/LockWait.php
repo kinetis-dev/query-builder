@@ -6,8 +6,8 @@ namespace Kinetis\QueryBuilder;
 
 /**
  * What Query::lockForUpdate() does when another transaction already holds
- * a lock on a row it selects. All three compile identically on MySQL 8.4,
- * MariaDB 11.4 and PostgreSQL 16.
+ * a lock on a row it selects. All three compile identically on MySQL 9.7,
+ * MariaDB 11.4 and PostgreSQL 18.
  */
 enum LockWait
 {
